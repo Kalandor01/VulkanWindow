@@ -6,6 +6,7 @@ using Silk.NET.Vulkan;
 using Silk.NET.Vulkan.Extensions.EXT;
 using Silk.NET.Vulkan.Extensions.KHR;
 using Silk.NET.Windowing;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
 // From the tutorial at "https://github.com/dfkeenan/SilkVulkanTutorial".
@@ -32,8 +33,8 @@ namespace VulkanWindow
     public class VulkanWindow : IDisposable
     {
         #region Fields
-        private IWindow window;
-        private Vk vulkan;
+        private IWindow? window;
+        private Vk? vulkan;
         private Instance vulkanInstance;
         private ExtDebugUtils? debugUtils;
         private DebugUtilsMessengerEXT debugMessenger;
@@ -42,6 +43,7 @@ namespace VulkanWindow
         private Queue graphicsQueue;
         private KhrSurface? khrSurface;
         private SurfaceKHR surface;
+        private Queue presentQueue;
 
         private KhrSwapchain? khrSwapChain;
         private SwapchainKHR swapChain;
@@ -63,8 +65,7 @@ namespace VulkanWindow
         public VulkanWindow(int width, int height)
         {
             //Create a window.
-            var options = WindowOptions.Default;
-            options.API = GraphicsAPI.DefaultVulkan;
+            var options = WindowOptions.DefaultVulkan;
             options.Size = new Vector2D<int>(width, height);
             options.Title = "test";
 
@@ -80,7 +81,7 @@ namespace VulkanWindow
 
             if (window.VkSurface is null)
             {
-                throw new Exception("Platform doesn't support Vulkan.");
+                throw new Exception("Windowing platform doesn't support Vulkan.");
             }
 
             InitVulkan();
@@ -89,7 +90,7 @@ namespace VulkanWindow
         #region Public methods
         public void Display()
         {
-            window.Run();
+            window!.Run();
         }
 
         public void Dispose()
@@ -166,7 +167,7 @@ namespace VulkanWindow
                     ApplicationVersion = new Version32(1, 0, 0),
                     PEngineName = (byte*)Marshal.StringToHGlobalAnsi("No Engine"),
                     EngineVersion = new Version32(1, 0, 0),
-                    ApiVersion = Vk.Version11
+                    ApiVersion = Vk.Version12
                 };
 
                 var createInfo = new InstanceCreateInfo()
@@ -177,7 +178,7 @@ namespace VulkanWindow
 
                 var extensions = GetRequiredExtensions();
                 createInfo.EnabledExtensionCount = (uint)extensions.Length;
-                createInfo.PpEnabledExtensionNames = (byte**)SilkMarshal.StringArrayToPtr(extensions); ;
+                createInfo.PpEnabledExtensionNames = (byte**)SilkMarshal.StringArrayToPtr(extensions);
 
                 if (EnableValidationLayers)
                 {
@@ -211,6 +212,48 @@ namespace VulkanWindow
             }
         }
 
+        private bool CheckDeviceExtensionsSupport(PhysicalDevice device)
+        {
+            uint extentionsCount = 0;
+            HashSet<string?>? availableExtensionNames = null;
+            unsafe
+            {
+                vulkan!.EnumerateDeviceExtensionProperties(device, (byte*)null, ref extentionsCount, null);
+
+                var availableExtensions = new ExtensionProperties[extentionsCount];
+                fixed (ExtensionProperties* availableExtensionsPtr = availableExtensions)
+                {
+                    vulkan!.EnumerateDeviceExtensionProperties(device, (byte*)null, ref extentionsCount, availableExtensionsPtr);
+                }
+
+                availableExtensionNames = availableExtensions.Select(extension => Marshal.PtrToStringAnsi((IntPtr)extension.ExtensionName)).ToHashSet();
+            }
+
+            if (availableExtensionNames is null)
+            {
+                return false;
+            }
+
+            return deviceExtensions.All(availableExtensionNames.Contains);
+
+        }
+
+        private bool IsDeviceSuitable(PhysicalDevice device)
+        {
+            var indices = FindQueueFamilies(device);
+
+            var extensionsSupported = CheckDeviceExtensionsSupport(device);
+
+            var swapChainAdequate = false;
+            if (extensionsSupported)
+            {
+                var swapChainSupport = QuerySwapChainSupport(device);
+                swapChainAdequate = swapChainSupport.Formats.Length != 0 && swapChainSupport.PresentModes.Length != 0;
+            }
+
+            return indices.IsComplete() && extensionsSupported && swapChainAdequate;
+        }
+
         private void PickPhysicalDevice()
         {
             var devices = vulkan!.GetPhysicalDevices(vulkanInstance);
@@ -228,13 +271,6 @@ namespace VulkanWindow
             {
                 throw new Exception("failed to find a suitable GPU!");
             }
-        }
-
-        private bool IsDeviceSuitable(PhysicalDevice device)
-        {
-            var indices = FindQueueFamilies(device);
-
-            return indices.IsComplete();
         }
 
         private QueueFamilyIndices FindQueueFamilies(PhysicalDevice device)
@@ -284,25 +320,35 @@ namespace VulkanWindow
         {
             var indices = FindQueueFamilies(physicalDevice);
 
-            var queueCreateInfo = new DeviceQueueCreateInfo()
-            {
-                SType = StructureType.DeviceQueueCreateInfo,
-                QueueFamilyIndex = indices.GraphicsFamily!.Value,
-                QueueCount = 1
-            };
+            var uniqueQueueFamilies = new[] { indices.GraphicsFamily!.Value, indices.PresentFamily!.Value };
+            uniqueQueueFamilies = uniqueQueueFamilies.Distinct().ToArray();
 
-            float queuePriority = 1.0f;
-            queueCreateInfo.PQueuePriorities = &queuePriority;
+            using var mem = GlobalMemory.Allocate(uniqueQueueFamilies.Length * sizeof(DeviceQueueCreateInfo));
+            var queueCreateInfos = (DeviceQueueCreateInfo*)Unsafe.AsPointer(ref mem.GetPinnableReference());
+
+
+            var queuePriority = 1.0f;
+            for (int i = 0; i < uniqueQueueFamilies.Length; i++)
+            {
+                queueCreateInfos[i] = new()
+                {
+                    SType = StructureType.DeviceQueueCreateInfo,
+                    QueueFamilyIndex = uniqueQueueFamilies[i],
+                    QueueCount = 1,
+                    PQueuePriorities = &queuePriority
+                };
+            }
 
             var deviceFeatures = new PhysicalDeviceFeatures();
 
             var createInfo = new DeviceCreateInfo()
             {
                 SType = StructureType.DeviceCreateInfo,
-                QueueCreateInfoCount = 1,
-                PQueueCreateInfos = &queueCreateInfo,
+                QueueCreateInfoCount = (uint)uniqueQueueFamilies.Length,
+                PQueueCreateInfos = queueCreateInfos,
                 PEnabledFeatures = &deviceFeatures,
-                EnabledExtensionCount = 0
+                EnabledExtensionCount = (uint)deviceExtensions.Length,
+                PpEnabledExtensionNames = (byte**)SilkMarshal.StringArrayToPtr(deviceExtensions),
             };
 
             if (EnableValidationLayers)
@@ -321,11 +367,14 @@ namespace VulkanWindow
             }
 
             vulkan!.GetDeviceQueue(device, indices.GraphicsFamily!.Value, 0, out graphicsQueue);
+            vulkan!.GetDeviceQueue(device, indices.PresentFamily!.Value, 0, out presentQueue);
 
             if (EnableValidationLayers)
             {
                 SilkMarshal.Free((nint)createInfo.PpEnabledLayerNames);
             }
+
+            SilkMarshal.Free((nint)createInfo.PpEnabledExtensionNames);
         }
 
         private void CreateSurface()
@@ -411,7 +460,7 @@ namespace VulkanWindow
                 }
                 else
                 {
-                    details.Formats = Array.Empty<SurfaceFormatKHR>();
+                    details.Formats = [];
                 }
 
                 uint presentModeCount = 0;
@@ -575,7 +624,7 @@ namespace VulkanWindow
         public void OnLoad()
         {
             //Set-up input context.
-            var input = window.CreateInput();
+            var input = window!.CreateInput();
             for (int i = 0; i < input.Keyboards.Count; i++)
             {
                 input.Keyboards[i].KeyDown += KeyDown;
@@ -602,7 +651,7 @@ namespace VulkanWindow
             //Check to close the window on escape.
             if (arg2 == Key.Escape)
             {
-                window.Close();
+                window!.Close();
             }
         }
         #endregion
