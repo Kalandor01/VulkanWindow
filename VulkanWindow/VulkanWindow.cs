@@ -8,6 +8,7 @@ using Silk.NET.Vulkan.Extensions.KHR;
 using Silk.NET.Windowing;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using Semaphore = Silk.NET.Vulkan.Semaphore;
 
 // From the tutorial at "https://github.com/dfkeenan/SilkVulkanTutorial".
 namespace VulkanWindow
@@ -55,6 +56,16 @@ namespace VulkanWindow
         private PipelineLayout pipelineLayout;
         private RenderPass renderPass;
         private Pipeline graphicsPipeline;
+        private Framebuffer[]? swapChainFramebuffers;
+
+        private CommandPool commandPool;
+        private CommandBuffer[]? commandBuffers;
+
+        private Semaphore[]? imageAvailableSemaphores;
+        private Semaphore[]? renderFinishedSemaphores;
+        private Fence[]? inFlightFences;
+        private Fence[]? imagesInFlight;
+        private int currentFrame = 0;
 
         bool EnableValidationLayers = true;
 
@@ -65,6 +76,8 @@ namespace VulkanWindow
         private readonly string[] deviceExtensions = [
             KhrSwapchain.ExtensionName,
         ];
+
+        const int MAX_FRAMES_IN_FLIGHT = 2;
         #endregion
 
         public VulkanWindow(int width, int height)
@@ -96,6 +109,7 @@ namespace VulkanWindow
         public void Display()
         {
             window!.Run();
+            vulkan!.DeviceWaitIdle(device);
         }
 
         public void Dispose()
@@ -103,6 +117,20 @@ namespace VulkanWindow
             DebugLog($"PHASE: {nameof(Dispose)}");
             unsafe
             {
+                for (int i = 0; i < MAX_FRAMES_IN_FLIGHT; i++)
+                {
+                    vulkan!.DestroySemaphore(device, renderFinishedSemaphores![i], null);
+                    vulkan!.DestroySemaphore(device, imageAvailableSemaphores![i], null);
+                    vulkan!.DestroyFence(device, inFlightFences![i], null);
+                }
+
+                vulkan!.DestroyCommandPool(device, commandPool, null);
+
+                foreach (var framebuffer in swapChainFramebuffers!)
+                {
+                    vulkan!.DestroyFramebuffer(device, framebuffer, null);
+                }
+
                 vulkan!.DestroyPipeline(device, graphicsPipeline, null);
                 vulkan!.DestroyPipelineLayout(device, pipelineLayout, null);
                 vulkan!.DestroyRenderPass(device, renderPass, null);
@@ -709,6 +737,16 @@ namespace VulkanWindow
                 Layout = ImageLayout.ColorAttachmentOptimal,
             };
 
+            var dependency = new SubpassDependency()
+            {
+                SrcSubpass = Vk.SubpassExternal,
+                DstSubpass = 0,
+                SrcStageMask = PipelineStageFlags.ColorAttachmentOutputBit,
+                SrcAccessMask = 0,
+                DstStageMask = PipelineStageFlags.ColorAttachmentOutputBit,
+                DstAccessMask = AccessFlags.ColorAttachmentWriteBit
+            };
+
             unsafe
             {
                 var subpass = new SubpassDescription()
@@ -725,6 +763,8 @@ namespace VulkanWindow
                     PAttachments = &colorAttachment,
                     SubpassCount = 1,
                     PSubpasses = &subpass,
+                    DependencyCount = 1,
+                    PDependencies = &dependency,
                 };
 
                 if (vulkan!.CreateRenderPass(device, in renderPassInfo, null, out renderPass) != Result.Success)
@@ -913,6 +953,168 @@ namespace VulkanWindow
         }
         #endregion
 
+        #region Create frame buffer
+        private void CreateFramebuffers()
+        {
+            swapChainFramebuffers = new Framebuffer[swapChainImageViews!.Length];
+
+            for (int i = 0; i < swapChainImageViews.Length; i++)
+            {
+                var attachment = swapChainImageViews[i];
+
+                unsafe
+                {
+                    var framebufferInfo = new FramebufferCreateInfo()
+                    {
+                        SType = StructureType.FramebufferCreateInfo,
+                        RenderPass = renderPass,
+                        AttachmentCount = 1,
+                        PAttachments = &attachment,
+                        Width = swapChainExtent.Width,
+                        Height = swapChainExtent.Height,
+                        Layers = 1,
+                    };
+
+                    if (vulkan!.CreateFramebuffer(device, in framebufferInfo, null, out swapChainFramebuffers[i]) != Result.Success)
+                    {
+                        throw new Exception("failed to create framebuffer!");
+                    }
+                }
+            }
+        }
+        #endregion
+
+        #region Create command pool
+        private void CreateCommandPool()
+        {
+            var queueFamiliyIndicies = FindQueueFamilies(physicalDevice);
+
+            var poolInfo = new CommandPoolCreateInfo()
+            {
+                SType = StructureType.CommandPoolCreateInfo,
+                QueueFamilyIndex = queueFamiliyIndicies.GraphicsFamily!.Value,
+            };
+
+            unsafe
+            {
+                if (vulkan!.CreateCommandPool(device, in poolInfo, null, out commandPool) != Result.Success)
+                {
+                    throw new Exception("failed to create command pool!");
+                }
+            }
+        }
+        #endregion
+
+        #region Create command buffers
+        private void CreateCommandBuffers()
+        {
+            commandBuffers = new CommandBuffer[swapChainFramebuffers!.Length];
+
+            var allocInfo = new CommandBufferAllocateInfo()
+            {
+                SType = StructureType.CommandBufferAllocateInfo,
+                CommandPool = commandPool,
+                Level = CommandBufferLevel.Primary,
+                CommandBufferCount = (uint)commandBuffers.Length,
+            };
+
+            unsafe
+            {
+                fixed (CommandBuffer* commandBuffersPtr = commandBuffers)
+                {
+                    if (vulkan!.AllocateCommandBuffers(device, in allocInfo, commandBuffersPtr) != Result.Success)
+                    {
+                        throw new Exception("failed to allocate command buffers!");
+                    }
+                }
+            }
+
+            for (var x = 0; x < commandBuffers.Length; x++)
+            {
+                var beginInfo = new CommandBufferBeginInfo()
+                {
+                    SType = StructureType.CommandBufferBeginInfo,
+                };
+
+                if (vulkan!.BeginCommandBuffer(commandBuffers[x], in beginInfo) != Result.Success)
+                {
+                    throw new Exception("failed to begin recording command buffer!");
+                }
+
+                var renderPassInfo = new RenderPassBeginInfo()
+                {
+                    SType = StructureType.RenderPassBeginInfo,
+                    RenderPass = renderPass,
+                    Framebuffer = swapChainFramebuffers[x],
+                    RenderArea =
+                    {
+                        Offset = { X = 0, Y = 0 },
+                        Extent = swapChainExtent,
+                    }
+                };
+
+                var clearColor = new ClearValue()
+                {
+                    Color = new() { Float32_0 = 0, Float32_1 = 0, Float32_2 = 0, Float32_3 = 1 },
+                };
+
+                renderPassInfo.ClearValueCount = 1;
+
+                unsafe
+                {
+                    renderPassInfo.PClearValues = &clearColor;
+
+                    vulkan!.CmdBeginRenderPass(commandBuffers[x], &renderPassInfo, SubpassContents.Inline);
+                }
+
+                vulkan!.CmdBindPipeline(commandBuffers[x], PipelineBindPoint.Graphics, graphicsPipeline);
+
+                vulkan!.CmdDraw(commandBuffers[x], 3, 1, 0, 0);
+
+                vulkan!.CmdEndRenderPass(commandBuffers[x]);
+
+                if (vulkan!.EndCommandBuffer(commandBuffers[x]) != Result.Success)
+                {
+                    throw new Exception("failed to record command buffer!");
+                }
+            }
+        }
+        #endregion
+
+        #region Create sync object
+        private void CreateSyncObjects()
+        {
+            imageAvailableSemaphores = new Semaphore[MAX_FRAMES_IN_FLIGHT];
+            renderFinishedSemaphores = new Semaphore[MAX_FRAMES_IN_FLIGHT];
+            inFlightFences = new Fence[MAX_FRAMES_IN_FLIGHT];
+            imagesInFlight = new Fence[swapChainImages!.Length];
+
+            var semaphoreInfo = new SemaphoreCreateInfo()
+            {
+                SType = StructureType.SemaphoreCreateInfo,
+            };
+
+            var fenceInfo = new FenceCreateInfo()
+            {
+                SType = StructureType.FenceCreateInfo,
+                Flags = FenceCreateFlags.SignaledBit,
+            };
+
+            for (var i = 0; i < MAX_FRAMES_IN_FLIGHT; i++)
+            {
+                unsafe
+                {
+                    if (vulkan!.CreateSemaphore(device, in semaphoreInfo, null, out imageAvailableSemaphores[i]) != Result.Success ||
+                        vulkan!.CreateSemaphore(device, in semaphoreInfo, null, out renderFinishedSemaphores[i]) != Result.Success ||
+                        vulkan!.CreateFence(device, in fenceInfo, null, out inFlightFences[i]) != Result.Success)
+                    {
+                        throw new Exception("failed to create synchronization objects for a frame!");
+                    }
+                }
+            }
+        }
+        #endregion
+
         private void InitVulkan()
         {
             DebugLog($"PHASE: {nameof(CreateInstance)}");
@@ -933,6 +1135,14 @@ namespace VulkanWindow
             CreateRenderPass();
             DebugLog($"PHASE: {nameof(CreateGraphicsPipeline)}");
             CreateGraphicsPipeline();
+            DebugLog($"PHASE: {nameof(CreateFramebuffers)}");
+            CreateFramebuffers();
+            DebugLog($"PHASE: {nameof(CreateCommandPool)}");
+            CreateCommandPool();
+            DebugLog($"PHASE: {nameof(CreateCommandBuffers)}");
+            CreateCommandBuffers();
+            DebugLog($"PHASE: {nameof(CreateSyncObjects)}");
+            CreateSyncObjects();
         }
         #endregion
 
@@ -947,9 +1157,74 @@ namespace VulkanWindow
             }
         }
 
-        public void OnRender(double obj)
+        public void OnRender(double delta)
         {
-            //Here all rendering should be done.
+            vulkan!.WaitForFences(device, 1, in inFlightFences![currentFrame], true, ulong.MaxValue);
+
+            uint imageIndex = 0;
+            khrSwapChain!.AcquireNextImage(device, swapChain, ulong.MaxValue, imageAvailableSemaphores![currentFrame], default, ref imageIndex);
+
+            if (imagesInFlight![imageIndex].Handle != default)
+            {
+                vulkan!.WaitForFences(device, 1, in imagesInFlight[imageIndex], true, ulong.MaxValue);
+            }
+            imagesInFlight[imageIndex] = inFlightFences[currentFrame];
+
+            var submitInfo = new SubmitInfo()
+            {
+                SType = StructureType.SubmitInfo,
+            };
+
+            PresentInfoKHR presentInfo;
+            unsafe
+            {
+                var waitSemaphores = stackalloc[] { imageAvailableSemaphores[currentFrame] };
+                var waitStages = stackalloc[] { PipelineStageFlags.ColorAttachmentOutputBit };
+
+                var buffer = commandBuffers![imageIndex];
+
+                submitInfo = submitInfo with
+                {
+                    WaitSemaphoreCount = 1,
+                    PWaitSemaphores = waitSemaphores,
+                    PWaitDstStageMask = waitStages,
+
+                    CommandBufferCount = 1,
+                    PCommandBuffers = &buffer
+                };
+
+                var signalSemaphores = stackalloc[] { renderFinishedSemaphores![currentFrame] };
+                submitInfo = submitInfo with
+                {
+                    SignalSemaphoreCount = 1,
+                    PSignalSemaphores = signalSemaphores,
+                };
+
+                vulkan!.ResetFences(device, 1, in inFlightFences[currentFrame]);
+
+                if (vulkan!.QueueSubmit(graphicsQueue, 1, in submitInfo, inFlightFences[currentFrame]) != Result.Success)
+                {
+                    throw new Exception("failed to submit draw command buffer!");
+                }
+
+                var swapChains = stackalloc[] { swapChain };
+                presentInfo = new PresentInfoKHR()
+                {
+                    SType = StructureType.PresentInfoKhr,
+
+                    WaitSemaphoreCount = 1,
+                    PWaitSemaphores = signalSemaphores,
+
+                    SwapchainCount = 1,
+                    PSwapchains = swapChains,
+
+                    PImageIndices = &imageIndex
+                };
+            }
+
+            khrSwapChain.QueuePresent(presentQueue, in presentInfo);
+
+            currentFrame = (currentFrame + 1) % MAX_FRAMES_IN_FLIGHT;
         }
 
         public void OnUpdate(double obj)
