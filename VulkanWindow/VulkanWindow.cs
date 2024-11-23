@@ -8,6 +8,7 @@ using Silk.NET.Vulkan.Extensions.KHR;
 using Silk.NET.Windowing;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using Buffer = Silk.NET.Vulkan.Buffer;
 using Semaphore = Silk.NET.Vulkan.Semaphore;
 
 // From the tutorial at "https://github.com/dfkeenan/SilkVulkanTutorial".
@@ -29,6 +30,47 @@ namespace VulkanWindow
         public SurfaceCapabilitiesKHR Capabilities;
         public SurfaceFormatKHR[] Formats;
         public PresentModeKHR[] PresentModes;
+    }
+
+    struct Vertex
+    {
+        public Vector2D<float> pos;
+        public Vector3D<float> color;
+
+        public static VertexInputBindingDescription GetBindingDescription()
+        {
+            VertexInputBindingDescription bindingDescription = new()
+            {
+                Binding = 0,
+                Stride = (uint)Unsafe.SizeOf<Vertex>(),
+                InputRate = VertexInputRate.Vertex,
+            };
+
+            return bindingDescription;
+        }
+
+        public static VertexInputAttributeDescription[] GetAttributeDescriptions()
+        {
+            var attributeDescriptions = new[]
+            {
+            new VertexInputAttributeDescription()
+            {
+                Binding = 0,
+                Location = 0,
+                Format = Format.R32G32Sfloat,
+                Offset = (uint)Marshal.OffsetOf<Vertex>(nameof(pos)),
+            },
+            new VertexInputAttributeDescription()
+            {
+                Binding = 0,
+                Location = 1,
+                Format = Format.R32G32B32Sfloat,
+                Offset = (uint)Marshal.OffsetOf<Vertex>(nameof(color)),
+            }
+        };
+
+            return attributeDescriptions;
+        }
     }
 
     public class VulkanWindow : IDisposable
@@ -59,6 +101,12 @@ namespace VulkanWindow
         private Framebuffer[]? swapChainFramebuffers;
 
         private CommandPool commandPool;
+
+        private Buffer vertexBuffer;
+        private DeviceMemory vertexBufferMemory;
+        private Buffer indexBuffer;
+        private DeviceMemory indexBufferMemory;
+
         private CommandBuffer[]? commandBuffers;
 
         private Semaphore[]? imageAvailableSemaphores;
@@ -67,13 +115,30 @@ namespace VulkanWindow
         private Fence[]? imagesInFlight;
         private int currentFrame = 0;
 
+        private bool frameBufferResized = false;
+
+        private Vertex[] vertices =
+        [
+            new Vertex { pos = new Vector2D<float>(-0.5f,-0.5f), color = new Vector3D<float>(1.0f, 0.0f, 0.0f) },
+            new Vertex { pos = new Vector2D<float>(0.5f,-0.5f), color = new Vector3D<float>(0.0f, 1.0f, 0.0f) },
+            new Vertex { pos = new Vector2D<float>(0.5f,0.5f), color = new Vector3D<float>(0.0f, 0.0f, 1.0f) },
+            new Vertex { pos = new Vector2D<float>(-0.5f,0.5f), color = new Vector3D<float>(1.0f, 1.0f, 1.0f) },
+        ];
+
+        private ushort[] indices =
+        [
+            0, 1, 2, 2, 3, 0
+        ];
+
         bool EnableValidationLayers = true;
 
-        private readonly string[] validationLayers = [
+        private readonly string[] validationLayers =
+        [
             "VK_LAYER_KHRONOS_validation"
         ];
 
-        private readonly string[] deviceExtensions = [
+        private readonly string[] deviceExtensions =
+        [
             KhrSwapchain.ExtensionName,
         ];
 
@@ -94,6 +159,7 @@ namespace VulkanWindow
             window.Update += OnUpdate;
             window.Render += OnRender;
             window.FramebufferResize += OnFramebufferResize;
+            window.Resize += FramebufferResizeCallback;
 
             window.Initialize();
 
@@ -112,11 +178,43 @@ namespace VulkanWindow
             vulkan!.DeviceWaitIdle(device);
         }
 
+        private unsafe void CleanUpSwapChain()
+        {
+            foreach (var framebuffer in swapChainFramebuffers!)
+            {
+                vulkan!.DestroyFramebuffer(device, framebuffer, null);
+            }
+
+            fixed (CommandBuffer* commandBuffersPtr = commandBuffers)
+            {
+                vulkan!.FreeCommandBuffers(device, commandPool, (uint)commandBuffers!.Length, commandBuffersPtr);
+            }
+
+            vulkan!.DestroyPipeline(device, graphicsPipeline, null);
+            vulkan!.DestroyPipelineLayout(device, pipelineLayout, null);
+            vulkan!.DestroyRenderPass(device, renderPass, null);
+
+            foreach (var imageView in swapChainImageViews!)
+            {
+                vulkan!.DestroyImageView(device, imageView, null);
+            }
+
+            khrSwapChain!.DestroySwapchain(device, swapChain, null);
+        }
+
         public void Dispose()
         {
             DebugLog($"PHASE: {nameof(Dispose)}");
+
+            CleanUpSwapChain();
             unsafe
             {
+                vulkan!.DestroyBuffer(device, indexBuffer, null);
+                vulkan!.FreeMemory(device, indexBufferMemory, null);
+
+                vulkan!.DestroyBuffer(device, vertexBuffer, null);
+                vulkan!.FreeMemory(device, vertexBufferMemory, null);
+
                 for (int i = 0; i < MAX_FRAMES_IN_FLIGHT; i++)
                 {
                     vulkan!.DestroySemaphore(device, renderFinishedSemaphores![i], null);
@@ -125,22 +223,6 @@ namespace VulkanWindow
                 }
 
                 vulkan!.DestroyCommandPool(device, commandPool, null);
-
-                foreach (var framebuffer in swapChainFramebuffers!)
-                {
-                    vulkan!.DestroyFramebuffer(device, framebuffer, null);
-                }
-
-                vulkan!.DestroyPipeline(device, graphicsPipeline, null);
-                vulkan!.DestroyPipelineLayout(device, pipelineLayout, null);
-                vulkan!.DestroyRenderPass(device, renderPass, null);
-
-                foreach (var imageView in swapChainImageViews!)
-                {
-                    vulkan!.DestroyImageView(device, imageView, null);
-                }
-
-                khrSwapChain!.DestroySwapchain(device, swapChain, null);
                 vulkan!.DestroyDevice(device, null);
             }
 
@@ -353,6 +435,7 @@ namespace VulkanWindow
             if (EnableValidationLayers)
             {
                 Console.WriteLine($"Debug: " + message);
+                //System.Diagnostics.Debug.WriteLine($"Debug: " + message);
             }
         }
 
@@ -364,6 +447,7 @@ namespace VulkanWindow
         )
         {
             Console.WriteLine($"Debug: " + Marshal.PtrToStringAnsi((nint)pCallbackData->PMessage));
+            //System.Diagnostics.Debug.WriteLine($"Debug: " + Marshal.PtrToStringAnsi((nint)pCallbackData->PMessage));
             return Vk.False;
         }
 
@@ -646,13 +730,14 @@ namespace VulkanWindow
                 CompositeAlpha = CompositeAlphaFlagsKHR.OpaqueBitKhr,
                 PresentMode = presentMode,
                 Clipped = true,
-
-                OldSwapchain = default
             };
 
-            if (!vulkan!.TryGetDeviceExtension(vulkanInstance, device, out khrSwapChain))
+            if (khrSwapChain is null)
             {
-                throw new NotSupportedException("VK_KHR_swapchain extension not found.");
+                if (!vulkan!.TryGetDeviceExtension(vulkanInstance, device, out khrSwapChain))
+                {
+                    throw new NotSupportedException("VK_KHR_swapchain extension not found.");
+                }
             }
 
             unsafe
@@ -672,6 +757,30 @@ namespace VulkanWindow
 
             swapChainImageFormat = surfaceFormat.Format;
             swapChainExtent = extent;
+        }
+
+        private void RecreateSwapChain()
+        {
+            Vector2D<int> framebufferSize = window!.FramebufferSize;
+
+            while (framebufferSize.X == 0 || framebufferSize.Y == 0)
+            {
+                framebufferSize = window.FramebufferSize;
+                window.DoEvents();
+            }
+
+            vulkan!.DeviceWaitIdle(device);
+
+            CleanUpSwapChain();
+
+            CreateSwapChain();
+            CreateImageViews();
+            CreateRenderPass();
+            CreateGraphicsPipeline();
+            CreateFramebuffers();
+            CreateCommandBuffers();
+
+            imagesInFlight = new Fence[swapChainImages!.Length];
         }
         #endregion
 
@@ -800,7 +909,7 @@ namespace VulkanWindow
             return shaderModule;
         }
 
-        private void CreateGraphicsPipeline()
+        private unsafe void CreateGraphicsPipeline()
         {
             var vertShaderCode = File.ReadAllBytes("Shaders/vert.spv");
             var fragShaderCode = File.ReadAllBytes("Shaders/frag.spv");
@@ -808,90 +917,63 @@ namespace VulkanWindow
             var vertShaderModule = CreateShaderModule(vertShaderCode);
             var fragShaderModule = CreateShaderModule(fragShaderCode);
 
-            var vertexInputInfo = new PipelineVertexInputStateCreateInfo()
+            var vertShaderStageInfo = new PipelineShaderStageCreateInfo()
             {
-                SType = StructureType.PipelineVertexInputStateCreateInfo,
-                VertexBindingDescriptionCount = 0,
-                VertexAttributeDescriptionCount = 0,
+                SType = StructureType.PipelineShaderStageCreateInfo,
+                Stage = ShaderStageFlags.VertexBit,
+                Module = vertShaderModule,
+                PName = (byte*)SilkMarshal.StringToPtr("main")
             };
 
-            var inputAssembly = new PipelineInputAssemblyStateCreateInfo()
+            var fragShaderStageInfo = new PipelineShaderStageCreateInfo()
             {
-                SType = StructureType.PipelineInputAssemblyStateCreateInfo,
-                Topology = PrimitiveTopology.TriangleList,
-                PrimitiveRestartEnable = false,
+                SType = StructureType.PipelineShaderStageCreateInfo,
+                Stage = ShaderStageFlags.FragmentBit,
+                Module = fragShaderModule,
+                PName = (byte*)SilkMarshal.StringToPtr("main")
             };
 
-            var viewport = new Viewport()
+            var shaderStages = stackalloc[]
             {
-                X = 0,
-                Y = 0,
-                Width = swapChainExtent.Width,
-                Height = swapChainExtent.Height,
-                MinDepth = 0,
-                MaxDepth = 1,
+                vertShaderStageInfo,
+                fragShaderStageInfo
             };
 
-            var scissor = new Rect2D()
-            {
-                Offset = { X = 0, Y = 0 },
-                Extent = swapChainExtent,
-            };
+            var bindingDescription = Vertex.GetBindingDescription();
+            var attributeDescriptions = Vertex.GetAttributeDescriptions();
 
-            var rasterizer = new PipelineRasterizationStateCreateInfo()
+            fixed (VertexInputAttributeDescription* attributeDescriptionsPtr = attributeDescriptions)
             {
-                SType = StructureType.PipelineRasterizationStateCreateInfo,
-                DepthClampEnable = false,
-                RasterizerDiscardEnable = false,
-                PolygonMode = PolygonMode.Fill,
-                LineWidth = 1,
-                CullMode = CullModeFlags.BackBit,
-                FrontFace = FrontFace.Clockwise,
-                DepthBiasEnable = false,
-            };
-
-            var multisampling = new PipelineMultisampleStateCreateInfo()
-            {
-                SType = StructureType.PipelineMultisampleStateCreateInfo,
-                SampleShadingEnable = false,
-                RasterizationSamples = SampleCountFlags.Count1Bit,
-            };
-
-            var colorBlendAttachment = new PipelineColorBlendAttachmentState()
-            {
-                ColorWriteMask = ColorComponentFlags.RBit | ColorComponentFlags.GBit | ColorComponentFlags.BBit | ColorComponentFlags.ABit,
-                BlendEnable = false,
-            };
-
-            var pipelineLayoutInfo = new PipelineLayoutCreateInfo()
-            {
-                SType = StructureType.PipelineLayoutCreateInfo,
-                SetLayoutCount = 0,
-                PushConstantRangeCount = 0,
-            };
-
-            unsafe
-            {
-                var vertShaderStageInfo = new PipelineShaderStageCreateInfo()
+                var vertexInputInfo = new PipelineVertexInputStateCreateInfo()
                 {
-                    SType = StructureType.PipelineShaderStageCreateInfo,
-                    Stage = ShaderStageFlags.VertexBit,
-                    Module = vertShaderModule,
-                    PName = (byte*)SilkMarshal.StringToPtr("main")
+                    SType = StructureType.PipelineVertexInputStateCreateInfo,
+                    VertexBindingDescriptionCount = 1,
+                    VertexAttributeDescriptionCount = (uint)attributeDescriptions.Length,
+                    PVertexBindingDescriptions = &bindingDescription,
+                    PVertexAttributeDescriptions = attributeDescriptionsPtr,
                 };
 
-                var fragShaderStageInfo = new PipelineShaderStageCreateInfo()
+                var inputAssembly = new PipelineInputAssemblyStateCreateInfo()
                 {
-                    SType = StructureType.PipelineShaderStageCreateInfo,
-                    Stage = ShaderStageFlags.FragmentBit,
-                    Module = fragShaderModule,
-                    PName = (byte*)SilkMarshal.StringToPtr("main")
+                    SType = StructureType.PipelineInputAssemblyStateCreateInfo,
+                    Topology = PrimitiveTopology.TriangleList,
+                    PrimitiveRestartEnable = false,
                 };
 
-                var shaderStages = stackalloc[]
+                var viewport = new Viewport()
                 {
-                    vertShaderStageInfo,
-                    fragShaderStageInfo
+                    X = 0,
+                    Y = 0,
+                    Width = swapChainExtent.Width,
+                    Height = swapChainExtent.Height,
+                    MinDepth = 0,
+                    MaxDepth = 1,
+                };
+
+                var scissor = new Rect2D()
+                {
+                    Offset = { X = 0, Y = 0 },
+                    Extent = swapChainExtent,
                 };
 
                 var viewportState = new PipelineViewportStateCreateInfo()
@@ -901,6 +983,31 @@ namespace VulkanWindow
                     PViewports = &viewport,
                     ScissorCount = 1,
                     PScissors = &scissor,
+                };
+
+                var rasterizer = new PipelineRasterizationStateCreateInfo()
+                {
+                    SType = StructureType.PipelineRasterizationStateCreateInfo,
+                    DepthClampEnable = false,
+                    RasterizerDiscardEnable = false,
+                    PolygonMode = PolygonMode.Fill,
+                    LineWidth = 1,
+                    CullMode = CullModeFlags.BackBit,
+                    FrontFace = FrontFace.Clockwise,
+                    DepthBiasEnable = false,
+                };
+
+                var multisampling = new PipelineMultisampleStateCreateInfo()
+                {
+                    SType = StructureType.PipelineMultisampleStateCreateInfo,
+                    SampleShadingEnable = false,
+                    RasterizationSamples = SampleCountFlags.Count1Bit,
+                };
+
+                var colorBlendAttachment = new PipelineColorBlendAttachmentState()
+                {
+                    ColorWriteMask = ColorComponentFlags.RBit | ColorComponentFlags.GBit | ColorComponentFlags.BBit | ColorComponentFlags.ABit,
+                    BlendEnable = false,
                 };
 
                 var colorBlending = new PipelineColorBlendStateCreateInfo()
@@ -916,6 +1023,13 @@ namespace VulkanWindow
                 colorBlending.BlendConstants[1] = 0;
                 colorBlending.BlendConstants[2] = 0;
                 colorBlending.BlendConstants[3] = 0;
+
+                var pipelineLayoutInfo = new PipelineLayoutCreateInfo()
+                {
+                    SType = StructureType.PipelineLayoutCreateInfo,
+                    SetLayoutCount = 0,
+                    PushConstantRangeCount = 0,
+                };
 
                 if (vulkan!.CreatePipelineLayout(device, in pipelineLayoutInfo, null, out pipelineLayout) != Result.Success)
                 {
@@ -943,13 +1057,13 @@ namespace VulkanWindow
                 {
                     throw new Exception("failed to create graphics pipeline!");
                 }
-
-                vulkan!.DestroyShaderModule(device, fragShaderModule, null);
-                vulkan!.DestroyShaderModule(device, vertShaderModule, null);
-
-                SilkMarshal.Free((nint)vertShaderStageInfo.PName);
-                SilkMarshal.Free((nint)fragShaderStageInfo.PName);
             }
+
+            vulkan!.DestroyShaderModule(device, fragShaderModule, null);
+            vulkan!.DestroyShaderModule(device, vertShaderModule, null);
+
+            SilkMarshal.Free((nint)vertShaderStageInfo.PName);
+            SilkMarshal.Free((nint)fragShaderStageInfo.PName);
         }
         #endregion
 
@@ -1001,6 +1115,168 @@ namespace VulkanWindow
                 {
                     throw new Exception("failed to create command pool!");
                 }
+            }
+        }
+        #endregion
+
+        #region Create vertex buffer
+        private uint FindMemoryType(uint typeFilter, MemoryPropertyFlags properties)
+        {
+            PhysicalDeviceMemoryProperties memProperties;
+            unsafe
+            {
+                vulkan!.GetPhysicalDeviceMemoryProperties(physicalDevice, out memProperties);
+            }
+
+            for (var x = 0; x < memProperties.MemoryTypeCount; x++)
+            {
+                if ((typeFilter & (1 << x)) != 0 && (memProperties.MemoryTypes[x].PropertyFlags & properties) == properties)
+                {
+                    return (uint)x;
+                }
+            }
+
+            throw new Exception("failed to find suitable memory type!");
+        }
+
+        private void CreateBuffer(ulong size, BufferUsageFlags usage, MemoryPropertyFlags properties, ref Buffer buffer, ref DeviceMemory bufferMemory)
+        {
+            var bufferInfo = new BufferCreateInfo()
+            {
+                SType = StructureType.BufferCreateInfo,
+                Size = size,
+                Usage = usage,
+                SharingMode = SharingMode.Exclusive,
+            };
+
+            unsafe
+            {
+                fixed (Buffer* bufferPtr = &buffer)
+                {
+                    if (vulkan!.CreateBuffer(device, in bufferInfo, null, bufferPtr) != Result.Success)
+                    {
+                        throw new Exception("failed to create vertex buffer!");
+                    }
+                }
+            }
+
+            var memRequirements = new MemoryRequirements();
+            vulkan!.GetBufferMemoryRequirements(device, buffer, out memRequirements);
+
+            var allocateInfo = new MemoryAllocateInfo()
+            {
+                SType = StructureType.MemoryAllocateInfo,
+                AllocationSize = memRequirements.Size,
+                MemoryTypeIndex = FindMemoryType(memRequirements.MemoryTypeBits, properties),
+            };
+
+            unsafe
+            {
+                fixed (DeviceMemory* bufferMemoryPtr = &bufferMemory)
+                {
+                    if (vulkan!.AllocateMemory(device, in allocateInfo, null, bufferMemoryPtr) != Result.Success)
+                    {
+                        throw new Exception("failed to allocate vertex buffer memory!");
+                    }
+                }
+            }
+
+            vulkan!.BindBufferMemory(device, buffer, bufferMemory, 0);
+        }
+
+        private void CopyBuffer(Buffer srcBuffer, Buffer dstBuffer, ulong size)
+        {
+            var allocateInfo = new CommandBufferAllocateInfo()
+            {
+                SType = StructureType.CommandBufferAllocateInfo,
+                Level = CommandBufferLevel.Primary,
+                CommandPool = commandPool,
+                CommandBufferCount = 1,
+            };
+
+            vulkan!.AllocateCommandBuffers(device, in allocateInfo, out CommandBuffer commandBuffer);
+
+            var beginInfo = new CommandBufferBeginInfo()
+            {
+                SType = StructureType.CommandBufferBeginInfo,
+                Flags = CommandBufferUsageFlags.OneTimeSubmitBit,
+            };
+
+            vulkan!.BeginCommandBuffer(commandBuffer, in beginInfo);
+
+            var copyRegion = new BufferCopy()
+            {
+                Size = size,
+            };
+
+            vulkan!.CmdCopyBuffer(commandBuffer, srcBuffer, dstBuffer, 1, in copyRegion);
+
+            vulkan!.EndCommandBuffer(commandBuffer);
+
+            SubmitInfo submitInfo;
+            unsafe
+            {
+                submitInfo = new SubmitInfo()
+                {
+                    SType = StructureType.SubmitInfo,
+                    CommandBufferCount = 1,
+                    PCommandBuffers = &commandBuffer,
+                };
+            }
+
+            vulkan!.QueueSubmit(graphicsQueue, 1, in submitInfo, default);
+            vulkan!.QueueWaitIdle(graphicsQueue);
+
+            vulkan!.FreeCommandBuffers(device, commandPool, 1, in commandBuffer);
+        }
+
+        private void CreateVertexBuffer()
+        {
+            var bufferSize = (ulong)(Unsafe.SizeOf<Vertex>() * vertices.Length);
+
+            Buffer stagingBuffer = default;
+            DeviceMemory stagingBufferMemory = default;
+            CreateBuffer(bufferSize, BufferUsageFlags.TransferSrcBit, MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit, ref stagingBuffer, ref stagingBufferMemory);
+
+            unsafe
+            {
+                void* data;
+                vulkan!.MapMemory(device, stagingBufferMemory, 0, bufferSize, 0, &data);
+                vertices.AsSpan().CopyTo(new Span<Vertex>(data, vertices.Length));
+                vulkan!.UnmapMemory(device, stagingBufferMemory);
+
+                CreateBuffer(bufferSize, BufferUsageFlags.TransferDstBit | BufferUsageFlags.VertexBufferBit, MemoryPropertyFlags.DeviceLocalBit, ref vertexBuffer, ref vertexBufferMemory);
+
+                CopyBuffer(stagingBuffer, vertexBuffer, bufferSize);
+
+                vulkan!.DestroyBuffer(device, stagingBuffer, null);
+                vulkan!.FreeMemory(device, stagingBufferMemory, null);
+            }
+        }
+        #endregion
+
+        #region Create index buffer
+        private void CreateIndexBuffer()
+        {
+            var bufferSize = (ulong)(Unsafe.SizeOf<ushort>() * indices.Length);
+
+            Buffer stagingBuffer = default;
+            DeviceMemory stagingBufferMemory = default;
+            CreateBuffer(bufferSize, BufferUsageFlags.TransferSrcBit, MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit, ref stagingBuffer, ref stagingBufferMemory);
+
+            unsafe
+            {
+                void* data;
+                vulkan!.MapMemory(device, stagingBufferMemory, 0, bufferSize, 0, &data);
+                indices.AsSpan().CopyTo(new Span<ushort>(data, indices.Length));
+                vulkan!.UnmapMemory(device, stagingBufferMemory);
+
+                CreateBuffer(bufferSize, BufferUsageFlags.TransferDstBit | BufferUsageFlags.IndexBufferBit, MemoryPropertyFlags.DeviceLocalBit, ref indexBuffer, ref indexBufferMemory);
+
+                CopyBuffer(stagingBuffer, indexBuffer, bufferSize);
+
+                vulkan!.DestroyBuffer(device, stagingBuffer, null);
+                vulkan!.FreeMemory(device, stagingBufferMemory, null);
             }
         }
         #endregion
@@ -1069,8 +1345,20 @@ namespace VulkanWindow
 
                 vulkan!.CmdBindPipeline(commandBuffers[x], PipelineBindPoint.Graphics, graphicsPipeline);
 
-                vulkan!.CmdDraw(commandBuffers[x], 3, 1, 0, 0);
+                var vertexBuffers = new Buffer[] { vertexBuffer };
+                var offsets = new ulong[] { 0 };
 
+                unsafe
+                {
+                    fixed (ulong* offsetsPtr = offsets)
+                    fixed (Buffer* vertexBuffersPtr = vertexBuffers)
+                    {
+                        vulkan!.CmdBindVertexBuffers(commandBuffers[x], 0, 1, vertexBuffersPtr, offsetsPtr);
+                    }
+                }
+
+                vulkan!.CmdBindIndexBuffer(commandBuffers[x], indexBuffer, 0, IndexType.Uint16);
+                vulkan!.CmdDrawIndexed(commandBuffers[x], (uint)indices.Length, 1, 0, 0, 0);
                 vulkan!.CmdEndRenderPass(commandBuffers[x]);
 
                 if (vulkan!.EndCommandBuffer(commandBuffers[x]) != Result.Success)
@@ -1139,6 +1427,10 @@ namespace VulkanWindow
             CreateFramebuffers();
             DebugLog($"PHASE: {nameof(CreateCommandPool)}");
             CreateCommandPool();
+            DebugLog($"PHASE: {nameof(CreateVertexBuffer)}");
+            CreateVertexBuffer();
+            DebugLog($"PHASE: {nameof(CreateIndexBuffer)}");
+            CreateIndexBuffer();
             DebugLog($"PHASE: {nameof(CreateCommandBuffers)}");
             CreateCommandBuffers();
             DebugLog($"PHASE: {nameof(CreateSyncObjects)}");
@@ -1162,7 +1454,17 @@ namespace VulkanWindow
             vulkan!.WaitForFences(device, 1, in inFlightFences![currentFrame], true, ulong.MaxValue);
 
             uint imageIndex = 0;
-            khrSwapChain!.AcquireNextImage(device, swapChain, ulong.MaxValue, imageAvailableSemaphores![currentFrame], default, ref imageIndex);
+            var result = khrSwapChain!.AcquireNextImage(device, swapChain, ulong.MaxValue, imageAvailableSemaphores![currentFrame], default, ref imageIndex);
+
+            if (result == Result.ErrorOutOfDateKhr)
+            {
+                RecreateSwapChain();
+                return;
+            }
+            else if (result != Result.Success && result != Result.SuboptimalKhr)
+            {
+                throw new Exception("failed to acquire swap chain image!");
+            }
 
             if (imagesInFlight![imageIndex].Handle != default)
             {
@@ -1222,9 +1524,24 @@ namespace VulkanWindow
                 };
             }
 
-            khrSwapChain.QueuePresent(presentQueue, in presentInfo);
+            result = khrSwapChain.QueuePresent(presentQueue, in presentInfo);
+
+            if (result == Result.ErrorOutOfDateKhr || result == Result.SuboptimalKhr || frameBufferResized)
+            {
+                frameBufferResized = false;
+                RecreateSwapChain();
+            }
+            else if (result != Result.Success)
+            {
+                throw new Exception("failed to present swap chain image!");
+            }
 
             currentFrame = (currentFrame + 1) % MAX_FRAMES_IN_FLIGHT;
+        }
+
+        private void FramebufferResizeCallback(Vector2D<int> obj)
+        {
+            frameBufferResized = true;
         }
 
         public void OnUpdate(double obj)
