@@ -17,4 +17,9 @@
     <PackageReference Include="System.Text.Json" Version="9.0.0" />
   </ItemGroup>
 
+	<ItemGroup>
+		<VertexShader Include="../09_ShaderModules/**/*.vert" />
+		<FragmentShader Include="../09_ShaderModules/**/*.frag" />
+	</ItemGroup>
+
 </Project>

@@ -50,6 +50,11 @@ namespace VulkanWindow
         private Image[]? swapChainImages;
         private Format swapChainImageFormat;
         private Extent2D swapChainExtent;
+        private ImageView[]? swapChainImageViews;
+
+        private PipelineLayout pipelineLayout;
+        private RenderPass renderPass;
+        private Pipeline graphicsPipeline;
 
         bool EnableValidationLayers = true;
 
@@ -95,8 +100,18 @@ namespace VulkanWindow
 
         public void Dispose()
         {
+            DebugLog($"PHASE: {nameof(Dispose)}");
             unsafe
             {
+                vulkan!.DestroyPipeline(device, graphicsPipeline, null);
+                vulkan!.DestroyPipelineLayout(device, pipelineLayout, null);
+                vulkan!.DestroyRenderPass(device, renderPass, null);
+
+                foreach (var imageView in swapChainImageViews!)
+                {
+                    vulkan!.DestroyImageView(device, imageView, null);
+                }
+
                 khrSwapChain!.DestroySwapchain(device, swapChain, null);
                 vulkan!.DestroyDevice(device, null);
             }
@@ -305,6 +320,14 @@ namespace VulkanWindow
         #endregion
 
         #region Debugger
+        private void DebugLog(string message)
+        {
+            if (EnableValidationLayers)
+            {
+                Console.WriteLine($"Debug: " + message);
+            }
+        }
+
         private unsafe uint DebugCallback(
             DebugUtilsMessageSeverityFlagsEXT messageSeverity,
             DebugUtilsMessageTypeFlagsEXT messageTypes,
@@ -625,14 +648,292 @@ namespace VulkanWindow
         }
         #endregion
 
+        #region Create image views
+        private void CreateImageViews()
+        {
+            swapChainImageViews = new ImageView[swapChainImages!.Length];
+
+            for (int i = 0; i < swapChainImages.Length; i++)
+            {
+                ImageViewCreateInfo createInfo = new()
+                {
+                    SType = StructureType.ImageViewCreateInfo,
+                    Image = swapChainImages[i],
+                    ViewType = ImageViewType.Type2D,
+                    Format = swapChainImageFormat,
+                    Components =
+                {
+                    R = ComponentSwizzle.Identity,
+                    G = ComponentSwizzle.Identity,
+                    B = ComponentSwizzle.Identity,
+                    A = ComponentSwizzle.Identity,
+                },
+                    SubresourceRange =
+                {
+                    AspectMask = ImageAspectFlags.ColorBit,
+                    BaseMipLevel = 0,
+                    LevelCount = 1,
+                    BaseArrayLayer = 0,
+                    LayerCount = 1,
+                }
+
+                };
+
+                unsafe
+                {
+                    if (vulkan!.CreateImageView(device, in createInfo, null, out swapChainImageViews[i]) != Result.Success)
+                    {
+                        throw new Exception("failed to create image views!");
+                    }
+                }
+            }
+        }
+        #endregion
+
+        #region Create render pass
+        private void CreateRenderPass()
+        {
+            var colorAttachment = new AttachmentDescription()
+            {
+                Format = swapChainImageFormat,
+                Samples = SampleCountFlags.Count1Bit,
+                LoadOp = AttachmentLoadOp.Clear,
+                StoreOp = AttachmentStoreOp.Store,
+                StencilLoadOp = AttachmentLoadOp.DontCare,
+                InitialLayout = ImageLayout.Undefined,
+                FinalLayout = ImageLayout.PresentSrcKhr,
+            };
+
+            var colorAttachmentRef = new AttachmentReference()
+            {
+                Attachment = 0,
+                Layout = ImageLayout.ColorAttachmentOptimal,
+            };
+
+            unsafe
+            {
+                var subpass = new SubpassDescription()
+                {
+                    PipelineBindPoint = PipelineBindPoint.Graphics,
+                    ColorAttachmentCount = 1,
+                    PColorAttachments = &colorAttachmentRef,
+                };
+
+                var renderPassInfo = new RenderPassCreateInfo()
+                {
+                    SType = StructureType.RenderPassCreateInfo,
+                    AttachmentCount = 1,
+                    PAttachments = &colorAttachment,
+                    SubpassCount = 1,
+                    PSubpasses = &subpass,
+                };
+
+                if (vulkan!.CreateRenderPass(device, in renderPassInfo, null, out renderPass) != Result.Success)
+                {
+                    throw new Exception("failed to create render pass!");
+                }
+            }
+        }
+        #endregion
+
+        #region Create graphics pipeline
+        private ShaderModule CreateShaderModule(byte[] code)
+        {
+            var createInfo = new ShaderModuleCreateInfo()
+            {
+                SType = StructureType.ShaderModuleCreateInfo,
+                CodeSize = (nuint)code.Length,
+            };
+
+            ShaderModule shaderModule;
+            unsafe
+            {
+                fixed (byte* codePtr = code)
+                {
+                    createInfo.PCode = (uint*)codePtr;
+
+                    if (vulkan!.CreateShaderModule(device, in createInfo, null, out shaderModule) != Result.Success)
+                    {
+                        throw new Exception();
+                    }
+                }
+            }
+            return shaderModule;
+        }
+
+        private void CreateGraphicsPipeline()
+        {
+            var vertShaderCode = File.ReadAllBytes("../../../shaders/shader_base.vert");
+            var fragShaderCode = File.ReadAllBytes("../../../shaders/shader_base.frag");
+
+            var vertShaderModule = CreateShaderModule(vertShaderCode);
+            var fragShaderModule = CreateShaderModule(fragShaderCode);
+
+            var vertexInputInfo = new PipelineVertexInputStateCreateInfo()
+            {
+                SType = StructureType.PipelineVertexInputStateCreateInfo,
+                VertexBindingDescriptionCount = 0,
+                VertexAttributeDescriptionCount = 0,
+            };
+
+            var inputAssembly = new PipelineInputAssemblyStateCreateInfo()
+            {
+                SType = StructureType.PipelineInputAssemblyStateCreateInfo,
+                Topology = PrimitiveTopology.TriangleList,
+                PrimitiveRestartEnable = false,
+            };
+
+            var viewport = new Viewport()
+            {
+                X = 0,
+                Y = 0,
+                Width = swapChainExtent.Width,
+                Height = swapChainExtent.Height,
+                MinDepth = 0,
+                MaxDepth = 1,
+            };
+
+            var scissor = new Rect2D()
+            {
+                Offset = { X = 0, Y = 0 },
+                Extent = swapChainExtent,
+            };
+
+            var rasterizer = new PipelineRasterizationStateCreateInfo()
+            {
+                SType = StructureType.PipelineRasterizationStateCreateInfo,
+                DepthClampEnable = false,
+                RasterizerDiscardEnable = false,
+                PolygonMode = PolygonMode.Fill,
+                LineWidth = 1,
+                CullMode = CullModeFlags.BackBit,
+                FrontFace = FrontFace.Clockwise,
+                DepthBiasEnable = false,
+            };
+
+            var multisampling = new PipelineMultisampleStateCreateInfo()
+            {
+                SType = StructureType.PipelineMultisampleStateCreateInfo,
+                SampleShadingEnable = false,
+                RasterizationSamples = SampleCountFlags.Count1Bit,
+            };
+
+            var colorBlendAttachment = new PipelineColorBlendAttachmentState()
+            {
+                ColorWriteMask = ColorComponentFlags.RBit | ColorComponentFlags.GBit | ColorComponentFlags.BBit | ColorComponentFlags.ABit,
+                BlendEnable = false,
+            };
+
+            var pipelineLayoutInfo = new PipelineLayoutCreateInfo()
+            {
+                SType = StructureType.PipelineLayoutCreateInfo,
+                SetLayoutCount = 0,
+                PushConstantRangeCount = 0,
+            };
+
+            unsafe
+            {
+                var vertShaderStageInfo = new PipelineShaderStageCreateInfo()
+                {
+                    SType = StructureType.PipelineShaderStageCreateInfo,
+                    Stage = ShaderStageFlags.VertexBit,
+                    Module = vertShaderModule,
+                    PName = (byte*)SilkMarshal.StringToPtr("main")
+                };
+
+                var fragShaderStageInfo = new PipelineShaderStageCreateInfo()
+                {
+                    SType = StructureType.PipelineShaderStageCreateInfo,
+                    Stage = ShaderStageFlags.FragmentBit,
+                    Module = fragShaderModule,
+                    PName = (byte*)SilkMarshal.StringToPtr("main")
+                };
+
+                var shaderStages = stackalloc[]
+                {
+                    vertShaderStageInfo,
+                    fragShaderStageInfo
+                };
+
+                var viewportState = new PipelineViewportStateCreateInfo()
+                {
+                    SType = StructureType.PipelineViewportStateCreateInfo,
+                    ViewportCount = 1,
+                    PViewports = &viewport,
+                    ScissorCount = 1,
+                    PScissors = &scissor,
+                };
+
+                var colorBlending = new PipelineColorBlendStateCreateInfo()
+                {
+                    SType = StructureType.PipelineColorBlendStateCreateInfo,
+                    LogicOpEnable = false,
+                    LogicOp = LogicOp.Copy,
+                    AttachmentCount = 1,
+                    PAttachments = &colorBlendAttachment,
+                };
+
+                colorBlending.BlendConstants[0] = 0;
+                colorBlending.BlendConstants[1] = 0;
+                colorBlending.BlendConstants[2] = 0;
+                colorBlending.BlendConstants[3] = 0;
+
+                if (vulkan!.CreatePipelineLayout(device, in pipelineLayoutInfo, null, out pipelineLayout) != Result.Success)
+                {
+                    throw new Exception("failed to create pipeline layout!");
+                }
+
+                var pipelineInfo = new GraphicsPipelineCreateInfo()
+                {
+                    SType = StructureType.GraphicsPipelineCreateInfo,
+                    StageCount = 2,
+                    PStages = shaderStages,
+                    PVertexInputState = &vertexInputInfo,
+                    PInputAssemblyState = &inputAssembly,
+                    PViewportState = &viewportState,
+                    PRasterizationState = &rasterizer,
+                    PMultisampleState = &multisampling,
+                    PColorBlendState = &colorBlending,
+                    Layout = pipelineLayout,
+                    RenderPass = renderPass,
+                    Subpass = 0,
+                    BasePipelineHandle = default
+                };
+
+                if (vulkan!.CreateGraphicsPipelines(device, default, 1, in pipelineInfo, null, out graphicsPipeline) != Result.Success)
+                {
+                    throw new Exception("failed to create graphics pipeline!");
+                }
+
+                vulkan!.DestroyShaderModule(device, fragShaderModule, null);
+                vulkan!.DestroyShaderModule(device, vertShaderModule, null);
+
+                SilkMarshal.Free((nint)vertShaderStageInfo.PName);
+                SilkMarshal.Free((nint)fragShaderStageInfo.PName);
+            }
+        }
+        #endregion
+
         private void InitVulkan()
         {
+            DebugLog($"PHASE: {nameof(CreateInstance)}");
             CreateInstance();
+            DebugLog($"PHASE: {nameof(SetupDebugMessenger)}");
             SetupDebugMessenger();
+            DebugLog($"PHASE: {nameof(CreateSurface)}");
             CreateSurface();
+            DebugLog($"PHASE: {nameof(PickPhysicalDevice)}");
             PickPhysicalDevice();
+            DebugLog($"PHASE: {nameof(CreateLogicalDevice)}");
             CreateLogicalDevice();
+            DebugLog($"PHASE: {nameof(CreateSwapChain)}");
             CreateSwapChain();
+            DebugLog($"PHASE: {nameof(CreateImageViews)}");
+            CreateImageViews();
+            DebugLog($"PHASE: {nameof(CreateRenderPass)}");
+            CreateRenderPass();
+            DebugLog($"PHASE: {nameof(CreateGraphicsPipeline)}");
+            CreateGraphicsPipeline();
         }
         #endregion
 
