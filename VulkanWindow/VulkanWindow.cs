@@ -63,7 +63,7 @@ namespace VulkanWindow
         ];
 
         private readonly string[] deviceExtensions = [
-            KhrSwapchain.ExtensionName
+            KhrSwapchain.ExtensionName,
         ];
         #endregion
 
@@ -398,7 +398,6 @@ namespace VulkanWindow
             }
 
             return deviceExtensions.All(availableExtensionNames.Contains);
-
         }
 
         private bool IsDeviceSuitable(PhysicalDevice device)
@@ -763,8 +762,8 @@ namespace VulkanWindow
 
         private void CreateGraphicsPipeline()
         {
-            var vertShaderCode = File.ReadAllBytes("../../../shaders/shader_base.vert");
-            var fragShaderCode = File.ReadAllBytes("../../../shaders/shader_base.frag");
+            var vertShaderCode = File.ReadAllBytes("Shaders/vert.spv");
+            var fragShaderCode = File.ReadAllBytes("Shaders/frag.spv");
 
             var vertShaderModule = CreateShaderModule(vertShaderCode);
             var fragShaderModule = CreateShaderModule(fragShaderCode);

@@ -18,8 +18,8 @@
   </ItemGroup>
 
 	<ItemGroup>
-		<VertexShader Include="../09_ShaderModules/**/*.vert" />
-		<FragmentShader Include="../09_ShaderModules/**/*.frag" />
+		<VertexShader Include="Shaders/**/*.vert" />
+		<FragmentShader Include="Shaders/**/*.frag" />
 	</ItemGroup>
 
 </Project>
