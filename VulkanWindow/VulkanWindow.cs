@@ -121,6 +121,96 @@ namespace VulkanWindow
         #endregion
 
         #region Private methods
+        #region Common-er
+        private QueueFamilyIndices FindQueueFamilies(PhysicalDevice device)
+        {
+            var indices = new QueueFamilyIndices();
+
+            uint queueFamilityCount = 0;
+
+            unsafe
+            {
+                vulkan!.GetPhysicalDeviceQueueFamilyProperties(device, ref queueFamilityCount, null);
+
+                var queueFamilies = new QueueFamilyProperties[queueFamilityCount];
+                fixed (QueueFamilyProperties* queueFamiliesPtr = queueFamilies)
+                {
+                    vulkan!.GetPhysicalDeviceQueueFamilyProperties(device, ref queueFamilityCount, queueFamiliesPtr);
+                }
+
+                uint i = 0;
+                foreach (var queueFamily in queueFamilies)
+                {
+                    if (queueFamily.QueueFlags.HasFlag(QueueFlags.GraphicsBit))
+                    {
+                        indices.GraphicsFamily = i;
+                    }
+
+                    khrSurface!.GetPhysicalDeviceSurfaceSupport(device, i, surface, out var presentSupport);
+
+                    if (presentSupport)
+                    {
+                        indices.PresentFamily = i;
+                    }
+
+                    if (indices.IsComplete())
+                    {
+                        break;
+                    }
+
+                    i++;
+                }
+            }
+
+            return indices;
+        }
+
+        private SwapChainSupportDetails QuerySwapChainSupport(PhysicalDevice physicalDevice)
+        {
+            var details = new SwapChainSupportDetails();
+
+            khrSurface!.GetPhysicalDeviceSurfaceCapabilities(physicalDevice, surface, out details.Capabilities);
+
+            unsafe
+            {
+                uint formatCount = 0;
+                khrSurface.GetPhysicalDeviceSurfaceFormats(physicalDevice, surface, ref formatCount, null);
+
+                if (formatCount != 0)
+                {
+                    details.Formats = new SurfaceFormatKHR[formatCount];
+                    fixed (SurfaceFormatKHR* formatsPtr = details.Formats)
+                    {
+                        khrSurface.GetPhysicalDeviceSurfaceFormats(physicalDevice, surface, ref formatCount, formatsPtr);
+                    }
+                }
+                else
+                {
+                    details.Formats = [];
+                }
+
+                uint presentModeCount = 0;
+                khrSurface.GetPhysicalDeviceSurfacePresentModes(physicalDevice, surface, ref presentModeCount, null);
+
+                if (presentModeCount != 0)
+                {
+                    details.PresentModes = new PresentModeKHR[presentModeCount];
+                    fixed (PresentModeKHR* formatsPtr = details.PresentModes)
+                    {
+                        khrSurface.GetPhysicalDeviceSurfacePresentModes(physicalDevice, surface, ref presentModeCount, formatsPtr);
+                    }
+                }
+                else
+                {
+                    details.PresentModes = [];
+                }
+            }
+
+            return details;
+        }
+        #endregion
+
+        #region Create instance
         private unsafe bool CheckValidationLayerSupport()
         {
             uint layerCount = 0;
@@ -167,7 +257,7 @@ namespace VulkanWindow
                     ApplicationVersion = new Version32(1, 0, 0),
                     PEngineName = (byte*)Marshal.StringToHGlobalAnsi("No Engine"),
                     EngineVersion = new Version32(1, 0, 0),
-                    ApiVersion = Vk.Version12
+                    ApiVersion = Vk.Version13,
                 };
 
                 var createInfo = new InstanceCreateInfo()
@@ -175,6 +265,7 @@ namespace VulkanWindow
                     SType = StructureType.InstanceCreateInfo,
                     PApplicationInfo = &appInfo
                 };
+
 
                 var extensions = GetRequiredExtensions();
                 createInfo.EnabledExtensionCount = (uint)extensions.Length;
@@ -211,7 +302,56 @@ namespace VulkanWindow
                 }
             }
         }
+        #endregion
 
+        #region Debugger
+        private unsafe uint DebugCallback(
+            DebugUtilsMessageSeverityFlagsEXT messageSeverity,
+            DebugUtilsMessageTypeFlagsEXT messageTypes,
+            DebugUtilsMessengerCallbackDataEXT* pCallbackData,
+            void* pUserData
+        )
+        {
+            Console.WriteLine($"Debug: " + Marshal.PtrToStringAnsi((nint)pCallbackData->PMessage));
+            return Vk.False;
+        }
+
+        private void PopulateDebugMessengerCreateInfo(ref DebugUtilsMessengerCreateInfoEXT createInfo)
+        {
+            createInfo.SType = StructureType.DebugUtilsMessengerCreateInfoExt;
+            createInfo.MessageSeverity = DebugUtilsMessageSeverityFlagsEXT.VerboseBitExt |
+                                         DebugUtilsMessageSeverityFlagsEXT.WarningBitExt |
+                                         DebugUtilsMessageSeverityFlagsEXT.ErrorBitExt;
+            createInfo.MessageType = DebugUtilsMessageTypeFlagsEXT.GeneralBitExt |
+                                     DebugUtilsMessageTypeFlagsEXT.PerformanceBitExt |
+                                     DebugUtilsMessageTypeFlagsEXT.ValidationBitExt;
+            unsafe
+            {
+                createInfo.PfnUserCallback = (DebugUtilsMessengerCallbackFunctionEXT)DebugCallback;
+            }
+        }
+
+        private void SetupDebugMessenger()
+        {
+            if (!EnableValidationLayers) return;
+
+            //TryGetInstanceExtension equivilant to method CreateDebugUtilsMessengerEXT from original tutorial.
+            if (!vulkan!.TryGetInstanceExtension(vulkanInstance, out debugUtils)) return;
+
+            DebugUtilsMessengerCreateInfoEXT createInfo = new();
+            PopulateDebugMessengerCreateInfo(ref createInfo);
+
+            unsafe
+            {
+                if (debugUtils!.CreateDebugUtilsMessenger(vulkanInstance, in createInfo, null, out debugMessenger) != Result.Success)
+                {
+                    throw new Exception("failed to set up debug messenger!");
+                }
+            }
+        }
+        #endregion
+
+        #region Pick phisical device
         private bool CheckDeviceExtensionsSupport(PhysicalDevice device)
         {
             uint extentionsCount = 0;
@@ -272,50 +412,9 @@ namespace VulkanWindow
                 throw new Exception("failed to find a suitable GPU!");
             }
         }
+        #endregion
 
-        private QueueFamilyIndices FindQueueFamilies(PhysicalDevice device)
-        {
-            var indices = new QueueFamilyIndices();
-
-            uint queueFamilityCount = 0;
-
-            unsafe
-            {
-                vulkan!.GetPhysicalDeviceQueueFamilyProperties(device, ref queueFamilityCount, null);
-
-                var queueFamilies = new QueueFamilyProperties[queueFamilityCount];
-                fixed (QueueFamilyProperties* queueFamiliesPtr = queueFamilies)
-                {
-                    vulkan!.GetPhysicalDeviceQueueFamilyProperties(device, ref queueFamilityCount, queueFamiliesPtr);
-                }
-
-                uint i = 0;
-                foreach (var queueFamily in queueFamilies)
-                {
-                    if (queueFamily.QueueFlags.HasFlag(QueueFlags.GraphicsBit))
-                    {
-                        indices.GraphicsFamily = i;
-                    }
-
-                    khrSurface!.GetPhysicalDeviceSurfaceSupport(device, i, surface, out var presentSupport);
-
-                    if (presentSupport)
-                    {
-                        indices.PresentFamily = i;
-                    }
-
-                    if (indices.IsComplete())
-                    {
-                        break;
-                    }
-
-                    i++;
-                }
-            }
-
-            return indices;
-        }
-
+        #region Create logical device
         private unsafe void CreateLogicalDevice()
         {
             var indices = FindQueueFamilies(physicalDevice);
@@ -376,7 +475,9 @@ namespace VulkanWindow
 
             SilkMarshal.Free((nint)createInfo.PpEnabledExtensionNames);
         }
+        #endregion
 
+        #region Create Surface
         private void CreateSurface()
         {
             if (!vulkan!.TryGetInstanceExtension<KhrSurface>(vulkanInstance, out khrSurface))
@@ -389,7 +490,9 @@ namespace VulkanWindow
                 surface = window!.VkSurface!.Create<AllocationCallbacks>(vulkanInstance.ToHandle(), null).ToSurface();
             }
         }
+        #endregion
 
+        #region Create swap chain
         private SurfaceFormatKHR ChooseSwapSurfaceFormat(IReadOnlyList<SurfaceFormatKHR> availableFormats)
         {
             foreach (var availableFormat in availableFormats)
@@ -437,51 +540,6 @@ namespace VulkanWindow
 
                 return actualExtent;
             }
-        }
-
-        private SwapChainSupportDetails QuerySwapChainSupport(PhysicalDevice physicalDevice)
-        {
-            var details = new SwapChainSupportDetails();
-
-            khrSurface!.GetPhysicalDeviceSurfaceCapabilities(physicalDevice, surface, out details.Capabilities);
-
-            unsafe
-            {
-                uint formatCount = 0;
-                khrSurface.GetPhysicalDeviceSurfaceFormats(physicalDevice, surface, ref formatCount, null);
-
-                if (formatCount != 0)
-                {
-                    details.Formats = new SurfaceFormatKHR[formatCount];
-                    fixed (SurfaceFormatKHR* formatsPtr = details.Formats)
-                    {
-                        khrSurface.GetPhysicalDeviceSurfaceFormats(physicalDevice, surface, ref formatCount, formatsPtr);
-                    }
-                }
-                else
-                {
-                    details.Formats = [];
-                }
-
-                uint presentModeCount = 0;
-                khrSurface.GetPhysicalDeviceSurfacePresentModes(physicalDevice, surface, ref presentModeCount, null);
-
-                if (presentModeCount != 0)
-                {
-                    details.PresentModes = new PresentModeKHR[presentModeCount];
-                    fixed (PresentModeKHR* formatsPtr = details.PresentModes)
-                    {
-                        khrSurface.GetPhysicalDeviceSurfacePresentModes(physicalDevice, surface, ref presentModeCount, formatsPtr);
-                    }
-
-                }
-                else
-                {
-                    details.PresentModes = [];
-                }
-            }
-
-            return details;
         }
 
         private void CreateSwapChain()
@@ -565,6 +623,7 @@ namespace VulkanWindow
             swapChainImageFormat = surfaceFormat.Format;
             swapChainExtent = extent;
         }
+        #endregion
 
         private void InitVulkan()
         {
@@ -575,49 +634,6 @@ namespace VulkanWindow
             CreateLogicalDevice();
             CreateSwapChain();
         }
-
-        #region Debugger
-        private void PopulateDebugMessengerCreateInfo(ref DebugUtilsMessengerCreateInfoEXT createInfo)
-        {
-            createInfo.SType = StructureType.DebugUtilsMessengerCreateInfoExt;
-            createInfo.MessageSeverity = DebugUtilsMessageSeverityFlagsEXT.VerboseBitExt |
-                                         DebugUtilsMessageSeverityFlagsEXT.WarningBitExt |
-                                         DebugUtilsMessageSeverityFlagsEXT.ErrorBitExt;
-            createInfo.MessageType = DebugUtilsMessageTypeFlagsEXT.GeneralBitExt |
-                                     DebugUtilsMessageTypeFlagsEXT.PerformanceBitExt |
-                                     DebugUtilsMessageTypeFlagsEXT.ValidationBitExt;
-            unsafe
-            {
-                createInfo.PfnUserCallback = (DebugUtilsMessengerCallbackFunctionEXT)DebugCallback;
-            }
-        }
-
-        private void SetupDebugMessenger()
-        {
-            if (!EnableValidationLayers) return;
-
-            //TryGetInstanceExtension equivilant to method CreateDebugUtilsMessengerEXT from original tutorial.
-            if (!vulkan!.TryGetInstanceExtension(vulkanInstance, out debugUtils)) return;
-
-            DebugUtilsMessengerCreateInfoEXT createInfo = new();
-            PopulateDebugMessengerCreateInfo(ref createInfo);
-
-            unsafe
-            {
-                if (debugUtils!.CreateDebugUtilsMessenger(vulkanInstance, in createInfo, null, out debugMessenger) != Result.Success)
-                {
-                    throw new Exception("failed to set up debug messenger!");
-                }
-            }
-        }
-
-        private unsafe uint DebugCallback(DebugUtilsMessageSeverityFlagsEXT messageSeverity, DebugUtilsMessageTypeFlagsEXT messageTypes, DebugUtilsMessengerCallbackDataEXT* pCallbackData, void* pUserData)
-        {
-            Console.WriteLine($"validation layer:" + Marshal.PtrToStringAnsi((nint)pCallbackData->PMessage));
-
-            return Vk.False;
-        }
-        #endregion
         #endregion
 
         #region Events
