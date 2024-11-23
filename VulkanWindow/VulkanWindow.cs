@@ -73,6 +73,13 @@ namespace VulkanWindow
         }
     }
 
+    struct UniformBufferObject
+    {
+        public Matrix4X4<float> model;
+        public Matrix4X4<float> view;
+        public Matrix4X4<float> proj;
+    }
+
     public class VulkanWindow : IDisposable
     {
         #region Fields
@@ -94,11 +101,12 @@ namespace VulkanWindow
         private Format swapChainImageFormat;
         private Extent2D swapChainExtent;
         private ImageView[]? swapChainImageViews;
-
-        private PipelineLayout pipelineLayout;
-        private RenderPass renderPass;
-        private Pipeline graphicsPipeline;
         private Framebuffer[]? swapChainFramebuffers;
+
+        private RenderPass renderPass;
+        private DescriptorSetLayout descriptorSetLayout;
+        private PipelineLayout pipelineLayout;
+        private Pipeline graphicsPipeline;
 
         private CommandPool commandPool;
 
@@ -106,6 +114,12 @@ namespace VulkanWindow
         private DeviceMemory vertexBufferMemory;
         private Buffer indexBuffer;
         private DeviceMemory indexBufferMemory;
+
+        private Buffer[]? uniformBuffers;
+        private DeviceMemory[]? uniformBuffersMemory;
+
+        private DescriptorPool descriptorPool;
+        private DescriptorSet[]? descriptorSets;
 
         private CommandBuffer[]? commandBuffers;
 
@@ -145,8 +159,10 @@ namespace VulkanWindow
         const int MAX_FRAMES_IN_FLIGHT = 2;
         #endregion
 
-        public VulkanWindow(int width, int height)
+        public VulkanWindow(int width, int height, bool enableValidation)
         {
+            EnableValidationLayers = enableValidation;
+
             //Create a window.
             var options = WindowOptions.DefaultVulkan;
             options.Size = new Vector2D<int>(width, height);
@@ -178,30 +194,6 @@ namespace VulkanWindow
             vulkan!.DeviceWaitIdle(device);
         }
 
-        private unsafe void CleanUpSwapChain()
-        {
-            foreach (var framebuffer in swapChainFramebuffers!)
-            {
-                vulkan!.DestroyFramebuffer(device, framebuffer, null);
-            }
-
-            fixed (CommandBuffer* commandBuffersPtr = commandBuffers)
-            {
-                vulkan!.FreeCommandBuffers(device, commandPool, (uint)commandBuffers!.Length, commandBuffersPtr);
-            }
-
-            vulkan!.DestroyPipeline(device, graphicsPipeline, null);
-            vulkan!.DestroyPipelineLayout(device, pipelineLayout, null);
-            vulkan!.DestroyRenderPass(device, renderPass, null);
-
-            foreach (var imageView in swapChainImageViews!)
-            {
-                vulkan!.DestroyImageView(device, imageView, null);
-            }
-
-            khrSwapChain!.DestroySwapchain(device, swapChain, null);
-        }
-
         public void Dispose()
         {
             DebugLog($"PHASE: {nameof(Dispose)}");
@@ -209,6 +201,8 @@ namespace VulkanWindow
             CleanUpSwapChain();
             unsafe
             {
+                vulkan!.DestroyDescriptorSetLayout(device, descriptorSetLayout, null);
+
                 vulkan!.DestroyBuffer(device, indexBuffer, null);
                 vulkan!.FreeMemory(device, indexBufferMemory, null);
 
@@ -246,7 +240,39 @@ namespace VulkanWindow
         #endregion
 
         #region Private methods
-        #region Common-er
+        #region Other
+        private unsafe void CleanUpSwapChain()
+        {
+            foreach (var framebuffer in swapChainFramebuffers!)
+            {
+                vulkan!.DestroyFramebuffer(device, framebuffer, null);
+            }
+
+            fixed (CommandBuffer* commandBuffersPtr = commandBuffers)
+            {
+                vulkan!.FreeCommandBuffers(device, commandPool, (uint)commandBuffers!.Length, commandBuffersPtr);
+            }
+
+            vulkan!.DestroyPipeline(device, graphicsPipeline, null);
+            vulkan!.DestroyPipelineLayout(device, pipelineLayout, null);
+            vulkan!.DestroyRenderPass(device, renderPass, null);
+
+            foreach (var imageView in swapChainImageViews!)
+            {
+                vulkan!.DestroyImageView(device, imageView, null);
+            }
+
+            khrSwapChain!.DestroySwapchain(device, swapChain, null);
+
+            for (int i = 0; i < swapChainImages!.Length; i++)
+            {
+                vulkan!.DestroyBuffer(device, uniformBuffers![i], null);
+                vulkan!.FreeMemory(device, uniformBuffersMemory![i], null);
+            }
+
+            vulkan!.DestroyDescriptorPool(device, descriptorPool, null);
+        }
+
         private QueueFamilyIndices FindQueueFamilies(PhysicalDevice device)
         {
             var indices = new QueueFamilyIndices();
@@ -332,6 +358,35 @@ namespace VulkanWindow
             }
 
             return details;
+        }
+
+        private void UpdateUniformBuffer(uint currentImage)
+        {
+            //Silk Window has timing information so we are skipping the time code.
+            var time = (float)window!.Time;
+
+            UniformBufferObject ubo = new()
+            {
+                model = Matrix4X4<float>.Identity * Matrix4X4.CreateFromAxisAngle(new Vector3D<float>(0, 0, 1), time * Scalar.DegreesToRadians(90.0f)),
+                view = Matrix4X4.CreateLookAt(new Vector3D<float>(2, 2, 2), new Vector3D<float>(0, 0, 0), new Vector3D<float>(0, 0, 1)),
+                proj = Matrix4X4.CreatePerspectiveFieldOfView(Scalar.DegreesToRadians(45.0f), (float)swapChainExtent.Width / swapChainExtent.Height, 0.1f, 10.0f),
+            };
+            ubo.proj.M22 *= -1;
+
+            unsafe
+            {
+                void* data;
+                vulkan!.MapMemory(
+                    device,
+                    uniformBuffersMemory![currentImage],
+                    0,
+                    (ulong)Unsafe.SizeOf<UniformBufferObject>(),
+                    0,
+                    &data
+                );
+                new Span<UniformBufferObject>(data, 1)[0] = ubo;
+                vulkan!.UnmapMemory(device, uniformBuffersMemory![currentImage]);
+            }
         }
         #endregion
 
@@ -759,6 +814,19 @@ namespace VulkanWindow
             swapChainExtent = extent;
         }
 
+        private void CreateUniformBuffers()
+        {
+            var bufferSize = (ulong)Unsafe.SizeOf<UniformBufferObject>();
+
+            uniformBuffers = new Buffer[swapChainImages!.Length];
+            uniformBuffersMemory = new DeviceMemory[swapChainImages!.Length];
+
+            for (int i = 0; i < swapChainImages.Length; i++)
+            {
+                CreateBuffer(bufferSize, BufferUsageFlags.UniformBufferBit, MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit, ref uniformBuffers[i], ref uniformBuffersMemory[i]);
+            }
+        }
+
         private void RecreateSwapChain()
         {
             Vector2D<int> framebufferSize = window!.FramebufferSize;
@@ -778,6 +846,9 @@ namespace VulkanWindow
             CreateRenderPass();
             CreateGraphicsPipeline();
             CreateFramebuffers();
+            CreateUniformBuffers();
+            CreateDescriptorPool();
+            CreateDescriptorSets();
             CreateCommandBuffers();
 
             imagesInFlight = new Fence[swapChainImages!.Length];
@@ -884,6 +955,38 @@ namespace VulkanWindow
         }
         #endregion
 
+        #region Create descriptor set layout
+        private void CreateDescriptorSetLayout()
+        {
+            var uboLayoutBinding = new DescriptorSetLayoutBinding()
+            {
+                Binding = 0,
+                DescriptorCount = 1,
+                DescriptorType = DescriptorType.UniformBuffer,
+                PImmutableSamplers = null,
+                StageFlags = ShaderStageFlags.VertexBit,
+            };
+
+            unsafe
+            {
+                var layoutInfo = new DescriptorSetLayoutCreateInfo()
+                {
+                    SType = StructureType.DescriptorSetLayoutCreateInfo,
+                    BindingCount = 1,
+                    PBindings = &uboLayoutBinding,
+                };
+
+                fixed (DescriptorSetLayout* descriptorSetLayoutPtr = &descriptorSetLayout)
+                {
+                    if (vulkan!.CreateDescriptorSetLayout(device, in layoutInfo, null, descriptorSetLayoutPtr) != Result.Success)
+                    {
+                        throw new Exception("failed to create descriptor set layout!");
+                    }
+                }
+            }
+        }
+        #endregion
+
         #region Create graphics pipeline
         private ShaderModule CreateShaderModule(byte[] code)
         {
@@ -943,6 +1046,7 @@ namespace VulkanWindow
             var attributeDescriptions = Vertex.GetAttributeDescriptions();
 
             fixed (VertexInputAttributeDescription* attributeDescriptionsPtr = attributeDescriptions)
+            fixed (DescriptorSetLayout* descriptorSetLayoutPtr = &descriptorSetLayout)
             {
                 var vertexInputInfo = new PipelineVertexInputStateCreateInfo()
                 {
@@ -993,7 +1097,7 @@ namespace VulkanWindow
                     PolygonMode = PolygonMode.Fill,
                     LineWidth = 1,
                     CullMode = CullModeFlags.BackBit,
-                    FrontFace = FrontFace.Clockwise,
+                    FrontFace = FrontFace.CounterClockwise,
                     DepthBiasEnable = false,
                 };
 
@@ -1027,8 +1131,9 @@ namespace VulkanWindow
                 var pipelineLayoutInfo = new PipelineLayoutCreateInfo()
                 {
                     SType = StructureType.PipelineLayoutCreateInfo,
-                    SetLayoutCount = 0,
                     PushConstantRangeCount = 0,
+                    SetLayoutCount = 1,
+                    PSetLayouts = descriptorSetLayoutPtr
                 };
 
                 if (vulkan!.CreatePipelineLayout(device, in pipelineLayoutInfo, null, out pipelineLayout) != Result.Success)
@@ -1281,6 +1386,93 @@ namespace VulkanWindow
         }
         #endregion
 
+        #region Create descriptor pool
+        private void CreateDescriptorPool()
+        {
+            var poolSize = new DescriptorPoolSize()
+            {
+                Type = DescriptorType.UniformBuffer,
+                DescriptorCount = (uint)swapChainImages!.Length,
+            };
+
+            unsafe
+            {
+                var poolInfo = new DescriptorPoolCreateInfo()
+                {
+                    SType = StructureType.DescriptorPoolCreateInfo,
+                    PoolSizeCount = 1,
+                    PPoolSizes = &poolSize,
+                    MaxSets = (uint)swapChainImages!.Length,
+                };
+
+                fixed (DescriptorPool* descriptorPoolPtr = &descriptorPool)
+                {
+                    if (vulkan!.CreateDescriptorPool(device, in poolInfo, null, descriptorPoolPtr) != Result.Success)
+                    {
+                        throw new Exception("failed to create descriptor pool!");
+                    }
+                }
+            }
+        }
+        #endregion
+
+        #region Create descriptor sets
+        private void CreateDescriptorSets()
+        {
+            var layouts = new DescriptorSetLayout[swapChainImages!.Length];
+            Array.Fill(layouts, descriptorSetLayout);
+
+            unsafe
+            {
+                fixed (DescriptorSetLayout* layoutsPtr = layouts)
+                {
+                    var allocateInfo = new DescriptorSetAllocateInfo()
+                    {
+                        SType = StructureType.DescriptorSetAllocateInfo,
+                        DescriptorPool = descriptorPool,
+                        DescriptorSetCount = (uint)swapChainImages!.Length,
+                        PSetLayouts = layoutsPtr,
+                    };
+
+                    descriptorSets = new DescriptorSet[swapChainImages.Length];
+                    fixed (DescriptorSet* descriptorSetsPtr = descriptorSets)
+                    {
+                        if (vulkan!.AllocateDescriptorSets(device, in allocateInfo, descriptorSetsPtr) != Result.Success)
+                        {
+                            throw new Exception("failed to allocate descriptor sets!");
+                        }
+                    }
+                }
+            }
+
+            for (int i = 0; i < swapChainImages.Length; i++)
+            {
+                var bufferInfo = new DescriptorBufferInfo()
+                {
+                    Buffer = uniformBuffers![i],
+                    Offset = 0,
+                    Range = (ulong)Unsafe.SizeOf<UniformBufferObject>(),
+                };
+
+                unsafe
+                {
+                    var descriptorWrite = new WriteDescriptorSet()
+                    {
+                        SType = StructureType.WriteDescriptorSet,
+                        DstSet = descriptorSets[i],
+                        DstBinding = 0,
+                        DstArrayElement = 0,
+                        DescriptorType = DescriptorType.UniformBuffer,
+                        DescriptorCount = 1,
+                        PBufferInfo = &bufferInfo,
+                    };
+
+                    vulkan!.UpdateDescriptorSets(device, 1, in descriptorWrite, 0, null);
+                }
+            }
+        }
+        #endregion
+
         #region Create command buffers
         private void CreateCommandBuffers()
         {
@@ -1358,6 +1550,21 @@ namespace VulkanWindow
                 }
 
                 vulkan!.CmdBindIndexBuffer(commandBuffers[x], indexBuffer, 0, IndexType.Uint16);
+
+                unsafe
+                {
+                    vulkan!.CmdBindDescriptorSets(
+                        commandBuffers[x],
+                        PipelineBindPoint.Graphics,
+                        pipelineLayout,
+                        0,
+                        1,
+                        in descriptorSets![x],
+                        0,
+                        null
+                    );
+                }
+
                 vulkan!.CmdDrawIndexed(commandBuffers[x], (uint)indices.Length, 1, 0, 0, 0);
                 vulkan!.CmdEndRenderPass(commandBuffers[x]);
 
@@ -1421,6 +1628,8 @@ namespace VulkanWindow
             CreateImageViews();
             DebugLog($"PHASE: {nameof(CreateRenderPass)}");
             CreateRenderPass();
+            DebugLog($"PHASE: {nameof(CreateDescriptorSetLayout)}");
+            CreateDescriptorSetLayout();
             DebugLog($"PHASE: {nameof(CreateGraphicsPipeline)}");
             CreateGraphicsPipeline();
             DebugLog($"PHASE: {nameof(CreateFramebuffers)}");
@@ -1431,6 +1640,12 @@ namespace VulkanWindow
             CreateVertexBuffer();
             DebugLog($"PHASE: {nameof(CreateIndexBuffer)}");
             CreateIndexBuffer();
+            DebugLog($"PHASE: {nameof(CreateUniformBuffers)}");
+            CreateUniformBuffers();
+            DebugLog($"PHASE: {nameof(CreateDescriptorPool)}");
+            CreateDescriptorPool();
+            DebugLog($"PHASE: {nameof(CreateDescriptorSets)}");
+            CreateDescriptorSets();
             DebugLog($"PHASE: {nameof(CreateCommandBuffers)}");
             CreateCommandBuffers();
             DebugLog($"PHASE: {nameof(CreateSyncObjects)}");
@@ -1465,6 +1680,8 @@ namespace VulkanWindow
             {
                 throw new Exception("failed to acquire swap chain image!");
             }
+
+            UpdateUniformBuffer(imageIndex);
 
             if (imagesInFlight![imageIndex].Handle != default)
             {
@@ -1526,10 +1743,17 @@ namespace VulkanWindow
 
             result = khrSwapChain.QueuePresent(presentQueue, in presentInfo);
 
-            if (result == Result.ErrorOutOfDateKhr || result == Result.SuboptimalKhr || frameBufferResized)
+            if (
+                result == Result.ErrorOutOfDateKhr ||
+                result == Result.SuboptimalKhr ||
+                frameBufferResized
+            )
             {
-                frameBufferResized = false;
-                RecreateSwapChain();
+                if (frameBufferResized || window!.WindowState != WindowState.Normal)
+                {
+                    frameBufferResized = false;
+                    RecreateSwapChain();
+                }
             }
             else if (result != Result.Success)
             {
@@ -1539,9 +1763,9 @@ namespace VulkanWindow
             currentFrame = (currentFrame + 1) % MAX_FRAMES_IN_FLIGHT;
         }
 
-        private void FramebufferResizeCallback(Vector2D<int> obj)
+        private void FramebufferResizeCallback(Vector2D<int> newSize)
         {
-            frameBufferResized = true;
+            frameBufferResized = newSize.Y > 0 && newSize.X > 0;
         }
 
         public void OnUpdate(double obj)
