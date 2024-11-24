@@ -82,6 +82,11 @@ namespace VulkanWindow
 
     public class VulkanWindow : IDisposable
     {
+        #region Test constants
+        private const PolygonMode POLYGON_MODE = PolygonMode.Fill;
+        private const CullModeFlags CULLING_MODE = CullModeFlags.BackBit;
+        #endregion
+
         #region Fields
         private IWindow? window;
         private Vk? vulkan;
@@ -363,11 +368,11 @@ namespace VulkanWindow
         private void UpdateUniformBuffer(uint currentImage)
         {
             //Silk Window has timing information so we are skipping the time code.
-            var time = (float)window!.Time;
+            var time = window!.Time;
 
             UniformBufferObject ubo = new()
             {
-                model = Matrix4X4<float>.Identity * Matrix4X4.CreateFromAxisAngle(new Vector3D<float>(0, 0, 1), time * Scalar.DegreesToRadians(90.0f)),
+                model = Matrix4X4<float>.Identity * Matrix4X4.CreateFromAxisAngle(new Vector3D<float>(0, 0, 1), (float)time * Scalar.DegreesToRadians(90.0f)),
                 view = Matrix4X4.CreateLookAt(new Vector3D<float>(2, 2, 2), new Vector3D<float>(0, 0, 0), new Vector3D<float>(0, 0, 1)),
                 proj = Matrix4X4.CreatePerspectiveFieldOfView(Scalar.DegreesToRadians(45.0f), (float)swapChainExtent.Width / swapChainExtent.Height, 0.1f, 10.0f),
             };
@@ -1094,9 +1099,9 @@ namespace VulkanWindow
                     SType = StructureType.PipelineRasterizationStateCreateInfo,
                     DepthClampEnable = false,
                     RasterizerDiscardEnable = false,
-                    PolygonMode = PolygonMode.Fill,
+                    PolygonMode = POLYGON_MODE,
                     LineWidth = 1,
-                    CullMode = CullModeFlags.BackBit,
+                    CullMode = CULLING_MODE,
                     FrontFace = FrontFace.CounterClockwise,
                     DepthBiasEnable = false,
                 };
