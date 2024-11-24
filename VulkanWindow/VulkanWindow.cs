@@ -1,4 +1,5 @@
-﻿using Silk.NET.Core;
+﻿using Silk.NET.Assimp;
+using Silk.NET.Core;
 using Silk.NET.Core.Native;
 using Silk.NET.Input;
 using Silk.NET.Maths;
@@ -9,6 +10,8 @@ using Silk.NET.Windowing;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using Buffer = Silk.NET.Vulkan.Buffer;
+using File = System.IO.File;
+using Image = Silk.NET.Vulkan.Image;
 using Semaphore = Silk.NET.Vulkan.Semaphore;
 
 // From the tutorial at "https://github.com/dfkeenan/SilkVulkanTutorial".
@@ -34,8 +37,9 @@ namespace VulkanWindow
 
     struct Vertex
     {
-        public Vector2D<float> pos;
+        public Vector3D<float> pos;
         public Vector3D<float> color;
+        public Vector2D<float> textCoord;
 
         public static VertexInputBindingDescription GetBindingDescription()
         {
@@ -53,22 +57,28 @@ namespace VulkanWindow
         {
             var attributeDescriptions = new[]
             {
-            new VertexInputAttributeDescription()
-            {
-                Binding = 0,
-                Location = 0,
-                Format = Format.R32G32Sfloat,
-                Offset = (uint)Marshal.OffsetOf<Vertex>(nameof(pos)),
-            },
-            new VertexInputAttributeDescription()
-            {
-                Binding = 0,
-                Location = 1,
-                Format = Format.R32G32B32Sfloat,
-                Offset = (uint)Marshal.OffsetOf<Vertex>(nameof(color)),
-            }
-        };
-
+                new VertexInputAttributeDescription()
+                {
+                    Binding = 0,
+                    Location = 0,
+                    Format = Format.R32G32B32Sfloat,
+                    Offset = (uint)Marshal.OffsetOf<Vertex>(nameof(pos)),
+                },
+                new VertexInputAttributeDescription()
+                {
+                    Binding = 0,
+                    Location = 1,
+                    Format = Format.R32G32B32Sfloat,
+                    Offset = (uint)Marshal.OffsetOf<Vertex>(nameof(color)),
+                },
+                new VertexInputAttributeDescription()
+                {
+                    Binding = 0,
+                    Location = 2,
+                    Format = Format.R32G32Sfloat,
+                    Offset = (uint)Marshal.OffsetOf<Vertex>(nameof(textCoord)),
+                }
+            };
             return attributeDescriptions;
         }
     }
@@ -85,6 +95,9 @@ namespace VulkanWindow
         #region Test constants
         private const PolygonMode POLYGON_MODE = PolygonMode.Fill;
         private const CullModeFlags CULLING_MODE = CullModeFlags.BackBit;
+
+        const string MODEL_PATH = @"Assets\Objects\viking_room.obj";
+        const string TEXTURE_PATH = @"Assets\Textures\viking_room.png";
         #endregion
 
         #region Fields
@@ -94,6 +107,7 @@ namespace VulkanWindow
         private ExtDebugUtils? debugUtils;
         private DebugUtilsMessengerEXT debugMessenger;
         private PhysicalDevice physicalDevice;
+        private SampleCountFlags msaaSamples = SampleCountFlags.Count1Bit;
         private Device device;
         private Queue graphicsQueue;
         private KhrSurface? khrSurface;
@@ -114,6 +128,20 @@ namespace VulkanWindow
         private Pipeline graphicsPipeline;
 
         private CommandPool commandPool;
+
+        private Image colorImage;
+        private DeviceMemory colorImageMemory;
+        private ImageView colorImageView;
+
+        private Image depthImage;
+        private DeviceMemory depthImageMemory;
+        private ImageView depthImageView;
+
+        private uint mipLevels;
+        private Image textureImage;
+        private DeviceMemory textureImageMemory;
+        private ImageView textureImageView;
+        private Sampler textureSampler;
 
         private Buffer vertexBuffer;
         private DeviceMemory vertexBufferMemory;
@@ -136,18 +164,9 @@ namespace VulkanWindow
 
         private bool frameBufferResized = false;
 
-        private Vertex[] vertices =
-        [
-            new Vertex { pos = new Vector2D<float>(-0.5f,-0.5f), color = new Vector3D<float>(1.0f, 0.0f, 0.0f) },
-            new Vertex { pos = new Vector2D<float>(0.5f,-0.5f), color = new Vector3D<float>(0.0f, 1.0f, 0.0f) },
-            new Vertex { pos = new Vector2D<float>(0.5f,0.5f), color = new Vector3D<float>(0.0f, 0.0f, 1.0f) },
-            new Vertex { pos = new Vector2D<float>(-0.5f,0.5f), color = new Vector3D<float>(1.0f, 1.0f, 1.0f) },
-        ];
+        private Vertex[]? vertices;
 
-        private ushort[] indices =
-        [
-            0, 1, 2, 2, 3, 0
-        ];
+        private uint[]? indices;
 
         bool EnableValidationLayers = true;
 
@@ -206,6 +225,12 @@ namespace VulkanWindow
             CleanUpSwapChain();
             unsafe
             {
+                vulkan!.DestroySampler(device, textureSampler, null);
+                vulkan!.DestroyImageView(device, textureImageView, null);
+
+                vulkan!.DestroyImage(device, textureImage, null);
+                vulkan!.FreeMemory(device, textureImageMemory, null);
+
                 vulkan!.DestroyDescriptorSetLayout(device, descriptorSetLayout, null);
 
                 vulkan!.DestroyBuffer(device, indexBuffer, null);
@@ -248,6 +273,14 @@ namespace VulkanWindow
         #region Other
         private unsafe void CleanUpSwapChain()
         {
+            vulkan!.DestroyImageView(device, depthImageView, null);
+            vulkan!.DestroyImage(device, depthImage, null);
+            vulkan!.FreeMemory(device, depthImageMemory, null);
+
+            vulkan!.DestroyImageView(device, colorImageView, null);
+            vulkan!.DestroyImage(device, colorImage, null);
+            vulkan!.FreeMemory(device, colorImageMemory, null);
+
             foreach (var framebuffer in swapChainFramebuffers!)
             {
                 vulkan!.DestroyFramebuffer(device, framebuffer, null);
@@ -585,7 +618,26 @@ namespace VulkanWindow
                 swapChainAdequate = swapChainSupport.Formats.Length != 0 && swapChainSupport.PresentModes.Length != 0;
             }
 
-            return indices.IsComplete() && extensionsSupported && swapChainAdequate;
+            vulkan!.GetPhysicalDeviceFeatures(device, out PhysicalDeviceFeatures supportedFeatures);
+            return indices.IsComplete() && extensionsSupported && swapChainAdequate && supportedFeatures.SamplerAnisotropy;
+        }
+
+        private SampleCountFlags GetMaxUsableSampleCount()
+        {
+            vulkan!.GetPhysicalDeviceProperties(physicalDevice, out var physicalDeviceProperties);
+
+            var counts = physicalDeviceProperties.Limits.FramebufferColorSampleCounts & physicalDeviceProperties.Limits.FramebufferDepthSampleCounts;
+
+            return counts switch
+            {
+                var c when (c & SampleCountFlags.Count64Bit) != 0 => SampleCountFlags.Count64Bit,
+                var c when (c & SampleCountFlags.Count32Bit) != 0 => SampleCountFlags.Count32Bit,
+                var c when (c & SampleCountFlags.Count16Bit) != 0 => SampleCountFlags.Count16Bit,
+                var c when (c & SampleCountFlags.Count8Bit) != 0 => SampleCountFlags.Count8Bit,
+                var c when (c & SampleCountFlags.Count4Bit) != 0 => SampleCountFlags.Count4Bit,
+                var c when (c & SampleCountFlags.Count2Bit) != 0 => SampleCountFlags.Count2Bit,
+                _ => SampleCountFlags.Count1Bit
+            };
         }
 
         private void PickPhysicalDevice()
@@ -597,6 +649,7 @@ namespace VulkanWindow
                 if (IsDeviceSuitable(device))
                 {
                     physicalDevice = device;
+                    msaaSamples = GetMaxUsableSampleCount();
                     break;
                 }
             }
@@ -632,7 +685,10 @@ namespace VulkanWindow
                 };
             }
 
-            var deviceFeatures = new PhysicalDeviceFeatures();
+            var deviceFeatures = new PhysicalDeviceFeatures()
+            {
+                SamplerAnisotropy = true,
+            };
 
             var createInfo = new DeviceCreateInfo()
             {
@@ -850,6 +906,8 @@ namespace VulkanWindow
             CreateImageViews();
             CreateRenderPass();
             CreateGraphicsPipeline();
+            CreateColorResources();
+            CreateDepthResources();
             CreateFramebuffers();
             CreateUniformBuffers();
             CreateDescriptorPool();
@@ -861,43 +919,49 @@ namespace VulkanWindow
         #endregion
 
         #region Create image views
+        private ImageView CreateImageView(Image image, Format format, ImageAspectFlags aspectFlags, uint mipLevels)
+        {
+            var createInfo = new ImageViewCreateInfo()
+            {
+                SType = StructureType.ImageViewCreateInfo,
+                Image = image,
+                ViewType = ImageViewType.Type2D,
+                Format = format,
+                //Components =
+                //{
+                //    R = ComponentSwizzle.Identity,
+                //    G = ComponentSwizzle.Identity,
+                //    B = ComponentSwizzle.Identity,
+                //    A = ComponentSwizzle.Identity,
+                //},
+                SubresourceRange =
+                {
+                    AspectMask = aspectFlags,
+                    BaseMipLevel = 0,
+                    LevelCount = mipLevels,
+                    BaseArrayLayer = 0,
+                    LayerCount = 1,
+                }
+            };
+
+            unsafe
+            {
+                if (vulkan!.CreateImageView(device, in createInfo, null, out var imageView) != Result.Success)
+                {
+                    throw new Exception("failed to create image views!");
+                }
+
+                return imageView;
+            }
+        }
+
         private void CreateImageViews()
         {
             swapChainImageViews = new ImageView[swapChainImages!.Length];
 
-            for (int i = 0; i < swapChainImages.Length; i++)
+            for (int x = 0; x < swapChainImages.Length; x++)
             {
-                ImageViewCreateInfo createInfo = new()
-                {
-                    SType = StructureType.ImageViewCreateInfo,
-                    Image = swapChainImages[i],
-                    ViewType = ImageViewType.Type2D,
-                    Format = swapChainImageFormat,
-                    Components =
-                {
-                    R = ComponentSwizzle.Identity,
-                    G = ComponentSwizzle.Identity,
-                    B = ComponentSwizzle.Identity,
-                    A = ComponentSwizzle.Identity,
-                },
-                    SubresourceRange =
-                {
-                    AspectMask = ImageAspectFlags.ColorBit,
-                    BaseMipLevel = 0,
-                    LevelCount = 1,
-                    BaseArrayLayer = 0,
-                    LayerCount = 1,
-                }
-
-                };
-
-                unsafe
-                {
-                    if (vulkan!.CreateImageView(device, in createInfo, null, out swapChainImageViews[i]) != Result.Success)
-                    {
-                        throw new Exception("failed to create image views!");
-                    }
-                }
+                swapChainImageViews[x] = CreateImageView(swapChainImages[x], swapChainImageFormat, ImageAspectFlags.ColorBit, 1);
             }
         }
         #endregion
@@ -908,10 +972,34 @@ namespace VulkanWindow
             var colorAttachment = new AttachmentDescription()
             {
                 Format = swapChainImageFormat,
-                Samples = SampleCountFlags.Count1Bit,
+                Samples = msaaSamples,
                 LoadOp = AttachmentLoadOp.Clear,
                 StoreOp = AttachmentStoreOp.Store,
                 StencilLoadOp = AttachmentLoadOp.DontCare,
+                InitialLayout = ImageLayout.Undefined,
+                FinalLayout = ImageLayout.ColorAttachmentOptimal,
+            };
+
+            var depthAttachment = new AttachmentDescription()
+            {
+                Format = FindDepthFormat(),
+                Samples = msaaSamples,
+                LoadOp = AttachmentLoadOp.Clear,
+                StoreOp = AttachmentStoreOp.DontCare,
+                StencilLoadOp = AttachmentLoadOp.DontCare,
+                StencilStoreOp = AttachmentStoreOp.DontCare,
+                InitialLayout = ImageLayout.Undefined,
+                FinalLayout = ImageLayout.DepthStencilAttachmentOptimal,
+            };
+
+            var colorAttachmentResolve = new AttachmentDescription()
+            {
+                Format = swapChainImageFormat,
+                Samples = SampleCountFlags.Count1Bit,
+                LoadOp = AttachmentLoadOp.DontCare,
+                StoreOp = AttachmentStoreOp.Store,
+                StencilLoadOp = AttachmentLoadOp.DontCare,
+                StencilStoreOp = AttachmentStoreOp.DontCare,
                 InitialLayout = ImageLayout.Undefined,
                 FinalLayout = ImageLayout.PresentSrcKhr,
             };
@@ -922,39 +1010,62 @@ namespace VulkanWindow
                 Layout = ImageLayout.ColorAttachmentOptimal,
             };
 
-            var dependency = new SubpassDependency()
+            var depthAttachmentRef = new AttachmentReference()
             {
-                SrcSubpass = Vk.SubpassExternal,
-                DstSubpass = 0,
-                SrcStageMask = PipelineStageFlags.ColorAttachmentOutputBit,
-                SrcAccessMask = 0,
-                DstStageMask = PipelineStageFlags.ColorAttachmentOutputBit,
-                DstAccessMask = AccessFlags.ColorAttachmentWriteBit
+                Attachment = 1,
+                Layout = ImageLayout.DepthStencilAttachmentOptimal,
             };
 
+            AttachmentReference colorAttachmentResolveRef = new()
+            {
+                Attachment = 2,
+                Layout = ImageLayout.ColorAttachmentOptimal,
+            };
+
+            SubpassDescription subpass;
             unsafe
             {
-                var subpass = new SubpassDescription()
+                subpass = new SubpassDescription()
                 {
                     PipelineBindPoint = PipelineBindPoint.Graphics,
                     ColorAttachmentCount = 1,
                     PColorAttachments = &colorAttachmentRef,
+                    PDepthStencilAttachment = &depthAttachmentRef,
+                    PResolveAttachments = &colorAttachmentResolveRef,
                 };
+            }
 
-                var renderPassInfo = new RenderPassCreateInfo()
-                {
-                    SType = StructureType.RenderPassCreateInfo,
-                    AttachmentCount = 1,
-                    PAttachments = &colorAttachment,
-                    SubpassCount = 1,
-                    PSubpasses = &subpass,
-                    DependencyCount = 1,
-                    PDependencies = &dependency,
-                };
+            var dependency = new SubpassDependency()
+            {
+                SrcSubpass = Vk.SubpassExternal,
+                DstSubpass = 0,
+                SrcStageMask = PipelineStageFlags.ColorAttachmentOutputBit | PipelineStageFlags.EarlyFragmentTestsBit,
+                SrcAccessMask = 0,
+                DstStageMask = PipelineStageFlags.ColorAttachmentOutputBit | PipelineStageFlags.EarlyFragmentTestsBit,
+                DstAccessMask = AccessFlags.ColorAttachmentWriteBit | AccessFlags.DepthStencilAttachmentWriteBit
+            };
 
-                if (vulkan!.CreateRenderPass(device, in renderPassInfo, null, out renderPass) != Result.Success)
+            var attachments = new[] { colorAttachment, depthAttachment, colorAttachmentResolve };
+
+            unsafe
+            {
+                fixed (AttachmentDescription* attachmentsPtr = attachments)
                 {
-                    throw new Exception("failed to create render pass!");
+                    var renderPassInfo = new RenderPassCreateInfo()
+                    {
+                        SType = StructureType.RenderPassCreateInfo,
+                        AttachmentCount = (uint)attachments.Length,
+                        PAttachments = attachmentsPtr,
+                        SubpassCount = 1,
+                        PSubpasses = &subpass,
+                        DependencyCount = 1,
+                        PDependencies = &dependency,
+                    };
+
+                    if (vulkan!.CreateRenderPass(device, in renderPassInfo, null, out renderPass) != Result.Success)
+                    {
+                        throw new Exception("failed to create render pass!");
+                    }
                 }
             }
         }
@@ -972,17 +1083,29 @@ namespace VulkanWindow
                 StageFlags = ShaderStageFlags.VertexBit,
             };
 
+            var samplerLayoutBinding = new DescriptorSetLayoutBinding()
+            {
+                Binding = 1,
+                DescriptorCount = 1,
+                DescriptorType = DescriptorType.CombinedImageSampler,
+                PImmutableSamplers = null,
+                StageFlags = ShaderStageFlags.FragmentBit,
+            };
+
+            var bindings = new DescriptorSetLayoutBinding[] { uboLayoutBinding, samplerLayoutBinding };
+
             unsafe
             {
-                var layoutInfo = new DescriptorSetLayoutCreateInfo()
-                {
-                    SType = StructureType.DescriptorSetLayoutCreateInfo,
-                    BindingCount = 1,
-                    PBindings = &uboLayoutBinding,
-                };
-
+                fixed (DescriptorSetLayoutBinding* bindingsPtr = bindings)
                 fixed (DescriptorSetLayout* descriptorSetLayoutPtr = &descriptorSetLayout)
                 {
+                    var layoutInfo = new DescriptorSetLayoutCreateInfo()
+                    {
+                        SType = StructureType.DescriptorSetLayoutCreateInfo,
+                        BindingCount = (uint)bindings.Length,
+                        PBindings = bindingsPtr,
+                    };
+
                     if (vulkan!.CreateDescriptorSetLayout(device, in layoutInfo, null, descriptorSetLayoutPtr) != Result.Success)
                     {
                         throw new Exception("failed to create descriptor set layout!");
@@ -1110,7 +1233,17 @@ namespace VulkanWindow
                 {
                     SType = StructureType.PipelineMultisampleStateCreateInfo,
                     SampleShadingEnable = false,
-                    RasterizationSamples = SampleCountFlags.Count1Bit,
+                    RasterizationSamples = msaaSamples,
+                };
+
+                var depthStencil = new PipelineDepthStencilStateCreateInfo()
+                {
+                    SType = StructureType.PipelineDepthStencilStateCreateInfo,
+                    DepthTestEnable = true,
+                    DepthWriteEnable = true,
+                    DepthCompareOp = CompareOp.Less,
+                    DepthBoundsTestEnable = false,
+                    StencilTestEnable = false,
                 };
 
                 var colorBlendAttachment = new PipelineColorBlendAttachmentState()
@@ -1156,6 +1289,7 @@ namespace VulkanWindow
                     PViewportState = &viewportState,
                     PRasterizationState = &rasterizer,
                     PMultisampleState = &multisampling,
+                    PDepthStencilState = &depthStencil,
                     PColorBlendState = &colorBlending,
                     Layout = pipelineLayout,
                     RenderPass = renderPass,
@@ -1177,31 +1311,34 @@ namespace VulkanWindow
         }
         #endregion
 
-        #region Create frame buffer
+        #region Create frame buffers
         private void CreateFramebuffers()
         {
             swapChainFramebuffers = new Framebuffer[swapChainImageViews!.Length];
 
-            for (int i = 0; i < swapChainImageViews.Length; i++)
+            for (var x = 0; x < swapChainImageViews.Length; x++)
             {
-                var attachment = swapChainImageViews[i];
+                var attachments = new[] { colorImageView, depthImageView, swapChainImageViews[x] };
 
                 unsafe
                 {
-                    var framebufferInfo = new FramebufferCreateInfo()
+                    fixed (ImageView* attachmentsPtr = attachments)
                     {
-                        SType = StructureType.FramebufferCreateInfo,
-                        RenderPass = renderPass,
-                        AttachmentCount = 1,
-                        PAttachments = &attachment,
-                        Width = swapChainExtent.Width,
-                        Height = swapChainExtent.Height,
-                        Layers = 1,
-                    };
+                        var framebufferInfo = new FramebufferCreateInfo()
+                        {
+                            SType = StructureType.FramebufferCreateInfo,
+                            RenderPass = renderPass,
+                            AttachmentCount = (uint)attachments.Length,
+                            PAttachments = attachmentsPtr,
+                            Width = swapChainExtent.Width,
+                            Height = swapChainExtent.Height,
+                            Layers = 1,
+                        };
 
-                    if (vulkan!.CreateFramebuffer(device, in framebufferInfo, null, out swapChainFramebuffers[i]) != Result.Success)
-                    {
-                        throw new Exception("failed to create framebuffer!");
+                        if (vulkan!.CreateFramebuffer(device, in framebufferInfo, null, out swapChainFramebuffers[x]) != Result.Success)
+                        {
+                            throw new Exception("failed to create framebuffer!");
+                        }
                     }
                 }
             }
@@ -1224,6 +1361,461 @@ namespace VulkanWindow
                 if (vulkan!.CreateCommandPool(device, in poolInfo, null, out commandPool) != Result.Success)
                 {
                     throw new Exception("failed to create command pool!");
+                }
+            }
+        }
+        #endregion
+
+        #region Create color resources
+        private void CreateColorResources()
+        {
+            Format colorFormat = swapChainImageFormat;
+
+            CreateImage(swapChainExtent.Width, swapChainExtent.Height, 1, msaaSamples, colorFormat, ImageTiling.Optimal, ImageUsageFlags.TransientAttachmentBit | ImageUsageFlags.ColorAttachmentBit, MemoryPropertyFlags.DeviceLocalBit, ref colorImage, ref colorImageMemory);
+            colorImageView = CreateImageView(colorImage, colorFormat, ImageAspectFlags.ColorBit, 1);
+        }
+        #endregion
+
+        #region Create depth resources
+        private Format FindSupportedFormat(IEnumerable<Format> candidates, ImageTiling tiling, FormatFeatureFlags features)
+        {
+            foreach (var format in candidates)
+            {
+                vulkan!.GetPhysicalDeviceFormatProperties(physicalDevice, format, out var props);
+
+                if (tiling == ImageTiling.Linear && (props.LinearTilingFeatures & features) == features)
+                {
+                    return format;
+                }
+                else if (tiling == ImageTiling.Optimal && (props.OptimalTilingFeatures & features) == features)
+                {
+                    return format;
+                }
+            }
+
+            throw new Exception("failed to find supported format!");
+        }
+
+        private Format FindDepthFormat()
+        {
+            return FindSupportedFormat([Format.D32Sfloat, Format.D32SfloatS8Uint, Format.D24UnormS8Uint], ImageTiling.Optimal, FormatFeatureFlags.DepthStencilAttachmentBit);
+        }
+
+        private void CreateDepthResources()
+        {
+            var depthFormat = FindDepthFormat();
+
+            CreateImage(swapChainExtent.Width, swapChainExtent.Height, 1, msaaSamples, depthFormat, ImageTiling.Optimal, ImageUsageFlags.DepthStencilAttachmentBit, MemoryPropertyFlags.DeviceLocalBit, ref depthImage, ref depthImageMemory);
+            depthImageView = CreateImageView(depthImage, depthFormat, ImageAspectFlags.DepthBit, 1);
+        }
+        #endregion
+
+        #region Create texture image
+        private void GenerateMipMaps(Image image, Format imageFormat, uint width, uint height, uint mipLevels)
+        {
+            vulkan!.GetPhysicalDeviceFormatProperties(physicalDevice, imageFormat, out var formatProperties);
+
+            if ((formatProperties.OptimalTilingFeatures & FormatFeatureFlags.SampledImageFilterLinearBit) == 0)
+            {
+                throw new Exception("texture image format does not support linear blitting!");
+            }
+
+            var commandBuffer = BeginSingleTimeCommands();
+
+            var barrier = new ImageMemoryBarrier()
+            {
+                SType = StructureType.ImageMemoryBarrier,
+                Image = image,
+                SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                SubresourceRange =
+                {
+                    AspectMask = ImageAspectFlags.ColorBit,
+                    BaseArrayLayer = 0,
+                    LayerCount = 1,
+                    LevelCount = 1,
+                }
+            };
+
+            var mipWidth = width;
+            var mipHeight = height;
+
+            for (uint i = 1; i < mipLevels; i++)
+            {
+                barrier.SubresourceRange.BaseMipLevel = i - 1;
+                barrier.OldLayout = ImageLayout.TransferDstOptimal;
+                barrier.NewLayout = ImageLayout.TransferSrcOptimal;
+                barrier.SrcAccessMask = AccessFlags.TransferWriteBit;
+                barrier.DstAccessMask = AccessFlags.TransferReadBit;
+
+                unsafe
+                {
+                    vulkan!.CmdPipelineBarrier(
+                        commandBuffer, PipelineStageFlags.TransferBit, PipelineStageFlags.TransferBit, 0,
+                        0, null,
+                        0, null,
+                        1, in barrier
+                    );
+                }
+
+                ImageBlit blit = new()
+                {
+                    SrcOffsets =
+                    {
+                        Element0 = new Offset3D(0,0,0),
+                        Element1 = new Offset3D((int)mipWidth, (int)mipHeight, 1),
+                    },
+                    SrcSubresource =
+                    {
+                        AspectMask = ImageAspectFlags.ColorBit,
+                        MipLevel = i - 1,
+                        BaseArrayLayer = 0,
+                        LayerCount = 1,
+                    },
+                    DstOffsets =
+                    {
+                        Element0 = new Offset3D(0,0,0),
+                        Element1 = new Offset3D((int)(mipWidth > 1 ? mipWidth / 2 : 1), (int)(mipHeight > 1 ? mipHeight / 2 : 1),1),
+                    },
+                    DstSubresource =
+                    {
+                        AspectMask = ImageAspectFlags.ColorBit,
+                        MipLevel = i,
+                        BaseArrayLayer = 0,
+                        LayerCount = 1,
+                    },
+                };
+
+                vulkan!.CmdBlitImage(commandBuffer,
+                    image, ImageLayout.TransferSrcOptimal,
+                    image, ImageLayout.TransferDstOptimal,
+                    1, in blit,
+                    Filter.Linear);
+
+                barrier.OldLayout = ImageLayout.TransferSrcOptimal;
+                barrier.NewLayout = ImageLayout.ShaderReadOnlyOptimal;
+                barrier.SrcAccessMask = AccessFlags.TransferReadBit;
+                barrier.DstAccessMask = AccessFlags.ShaderReadBit;
+
+                unsafe
+                {
+                    vulkan!.CmdPipelineBarrier(
+                        commandBuffer, PipelineStageFlags.TransferBit, PipelineStageFlags.FragmentShaderBit, 0,
+                        0, null,
+                        0, null,
+                        1, in barrier
+                    );
+                }
+
+                if (mipWidth > 1) mipWidth /= 2;
+                if (mipHeight > 1) mipHeight /= 2;
+            }
+
+            barrier.SubresourceRange.BaseMipLevel = mipLevels - 1;
+            barrier.OldLayout = ImageLayout.TransferDstOptimal;
+            barrier.NewLayout = ImageLayout.ShaderReadOnlyOptimal;
+            barrier.SrcAccessMask = AccessFlags.TransferWriteBit;
+            barrier.DstAccessMask = AccessFlags.ShaderReadBit;
+
+            unsafe
+            {
+                vulkan!.CmdPipelineBarrier(
+                    commandBuffer, PipelineStageFlags.TransferBit, PipelineStageFlags.FragmentShaderBit, 0,
+                    0, null,
+                    0, null,
+                    1, in barrier
+                );
+            }
+
+            EndSingleTimeCommands(commandBuffer);
+        }
+
+        private void CreateTextureImage()
+        {
+            using var img = SixLabors.ImageSharp.Image.Load<SixLabors.ImageSharp.PixelFormats.Rgba32>(TEXTURE_PATH);
+
+            var imageSize = (ulong)(img.Width * img.Height * img.PixelType.BitsPerPixel / 8);
+            mipLevels = (uint)(Math.Floor(Math.Log2(Math.Max(img.Width, img.Height))) + 1);
+
+            Buffer stagingBuffer = default;
+            DeviceMemory stagingBufferMemory = default;
+            CreateBuffer(imageSize, BufferUsageFlags.TransferSrcBit, MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit, ref stagingBuffer, ref stagingBufferMemory);
+
+            unsafe
+            {
+                void* data;
+                vulkan!.MapMemory(device, stagingBufferMemory, 0, imageSize, 0, &data);
+                img.CopyPixelDataTo(new Span<byte>(data, (int)imageSize));
+                vulkan!.UnmapMemory(device, stagingBufferMemory);
+            }
+
+            CreateImage((uint)img.Width, (uint)img.Height, mipLevels, SampleCountFlags.Count1Bit, Format.R8G8B8A8Srgb, ImageTiling.Optimal, ImageUsageFlags.TransferSrcBit | ImageUsageFlags.TransferDstBit | ImageUsageFlags.SampledBit, MemoryPropertyFlags.DeviceLocalBit, ref textureImage, ref textureImageMemory);
+
+            TransitionImageLayout(textureImage, Format.R8G8B8A8Srgb, ImageLayout.Undefined, ImageLayout.TransferDstOptimal, mipLevels);
+            CopyBufferToImage(stagingBuffer, textureImage, (uint)img.Width, (uint)img.Height);
+            //Transitioned to VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL while generating mipmaps
+
+            unsafe
+            {
+                vulkan!.DestroyBuffer(device, stagingBuffer, null);
+                vulkan!.FreeMemory(device, stagingBufferMemory, null);
+            }
+
+            GenerateMipMaps(textureImage, Format.R8G8B8A8Srgb, (uint)img.Width, (uint)img.Height, mipLevels);
+        }
+
+        private void CreateImage(
+            uint width,
+            uint height,
+            uint mipLevels,
+            SampleCountFlags numSamples,
+            Format format,
+            ImageTiling tiling,
+            ImageUsageFlags usage,
+            MemoryPropertyFlags properties,
+            ref Image image,
+            ref DeviceMemory imageMemory
+        )
+        {
+            var imageInfo = new ImageCreateInfo()
+            {
+                SType = StructureType.ImageCreateInfo,
+                ImageType = ImageType.Type2D,
+                Extent =
+                {
+                    Width = width,
+                    Height = height,
+                    Depth = 1,
+                },
+                MipLevels = mipLevels,
+                ArrayLayers = 1,
+                Format = format,
+                Tiling = tiling,
+                InitialLayout = ImageLayout.Undefined,
+                Usage = usage,
+                Samples = numSamples,
+                SharingMode = SharingMode.Exclusive,
+            };
+
+            unsafe
+            {
+                fixed (Image* imagePtr = &image)
+                {
+                    if (vulkan!.CreateImage(device, in imageInfo, null, imagePtr) != Result.Success)
+                    {
+                        throw new Exception("failed to create image!");
+                    }
+                }
+            }
+
+            vulkan!.GetImageMemoryRequirements(device, image, out MemoryRequirements memRequirements);
+
+            var allocInfo = new MemoryAllocateInfo()
+            {
+                SType = StructureType.MemoryAllocateInfo,
+                AllocationSize = memRequirements.Size,
+                MemoryTypeIndex = FindMemoryType(memRequirements.MemoryTypeBits, properties),
+            };
+
+            unsafe
+            {
+                fixed (DeviceMemory* imageMemoryPtr = &imageMemory)
+                {
+                    if (vulkan!.AllocateMemory(device, in allocInfo, null, imageMemoryPtr) != Result.Success)
+                    {
+                        throw new Exception("failed to allocate image memory!");
+                    }
+                }
+            }
+
+            vulkan!.BindImageMemory(device, image, imageMemory, 0);
+        }
+
+        private void TransitionImageLayout(Image image, Format format, ImageLayout oldLayout, ImageLayout newLayout, uint mipLevels)
+        {
+            var commandBuffer = BeginSingleTimeCommands();
+
+            var barrier = new ImageMemoryBarrier()
+            {
+                SType = StructureType.ImageMemoryBarrier,
+                OldLayout = oldLayout,
+                NewLayout = newLayout,
+                SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                Image = image,
+                SubresourceRange =
+                {
+                    AspectMask = ImageAspectFlags.ColorBit,
+                    BaseMipLevel = 0,
+                    LevelCount = mipLevels,
+                    BaseArrayLayer = 0,
+                    LayerCount = 1,
+                }
+            };
+
+            PipelineStageFlags sourceStage;
+            PipelineStageFlags destinationStage;
+
+            if (oldLayout == ImageLayout.Undefined && newLayout == ImageLayout.TransferDstOptimal)
+            {
+                barrier.SrcAccessMask = 0;
+                barrier.DstAccessMask = AccessFlags.TransferWriteBit;
+
+                sourceStage = PipelineStageFlags.TopOfPipeBit;
+                destinationStage = PipelineStageFlags.TransferBit;
+            }
+            else if (oldLayout == ImageLayout.TransferDstOptimal && newLayout == ImageLayout.ShaderReadOnlyOptimal)
+            {
+                barrier.SrcAccessMask = AccessFlags.TransferWriteBit;
+                barrier.DstAccessMask = AccessFlags.ShaderReadBit;
+
+                sourceStage = PipelineStageFlags.TransferBit;
+                destinationStage = PipelineStageFlags.FragmentShaderBit;
+            }
+            else
+            {
+                throw new Exception("unsupported layout transition!");
+            }
+
+            unsafe
+            {
+                vulkan!.CmdPipelineBarrier(commandBuffer, sourceStage, destinationStage, 0, 0, null, 0, null, 1, in barrier);
+            }
+
+            EndSingleTimeCommands(commandBuffer);
+        }
+
+        private void CopyBufferToImage(Buffer buffer, Image image, uint width, uint height)
+        {
+            var commandBuffer = BeginSingleTimeCommands();
+
+            var region = new BufferImageCopy()
+            {
+                BufferOffset = 0,
+                BufferRowLength = 0,
+                BufferImageHeight = 0,
+                ImageSubresource =
+                {
+                    AspectMask = ImageAspectFlags.ColorBit,
+                    MipLevel = 0,
+                    BaseArrayLayer = 0,
+                    LayerCount = 1,
+                },
+                ImageOffset = new Offset3D(0, 0, 0),
+                ImageExtent = new Extent3D(width, height, 1),
+
+            };
+
+            vulkan!.CmdCopyBufferToImage(commandBuffer, buffer, image, ImageLayout.TransferDstOptimal, 1, in region);
+
+            EndSingleTimeCommands(commandBuffer);
+        }
+        #endregion
+
+        #region Create texture image view
+        private void CreateTextureImageView()
+        {
+            textureImageView = CreateImageView(textureImage, Format.R8G8B8A8Srgb, ImageAspectFlags.ColorBit, mipLevels);
+        }
+        #endregion
+
+        #region Create texture sampler
+        private void CreateTextureSampler()
+        {
+            vulkan!.GetPhysicalDeviceProperties(physicalDevice, out PhysicalDeviceProperties properties);
+
+            var samplerInfo = new SamplerCreateInfo()
+            {
+                SType = StructureType.SamplerCreateInfo,
+                MagFilter = Filter.Linear,
+                MinFilter = Filter.Linear,
+                AddressModeU = SamplerAddressMode.Repeat,
+                AddressModeV = SamplerAddressMode.Repeat,
+                AddressModeW = SamplerAddressMode.Repeat,
+                AnisotropyEnable = true,
+                MaxAnisotropy = properties.Limits.MaxSamplerAnisotropy,
+                BorderColor = BorderColor.IntOpaqueBlack,
+                UnnormalizedCoordinates = false,
+                CompareEnable = false,
+                CompareOp = CompareOp.Always,
+                MipmapMode = SamplerMipmapMode.Linear,
+                MinLod = 0,
+                MaxLod = mipLevels,
+                MipLodBias = 0,
+            };
+
+            unsafe
+            {
+                fixed (Sampler* textureSamplerPtr = &textureSampler)
+                {
+                    if (vulkan!.CreateSampler(device, in samplerInfo, null, textureSamplerPtr) != Result.Success)
+                    {
+                        throw new Exception("failed to create texture sampler!");
+                    }
+                }
+            }
+        }
+        #endregion
+
+        #region Load model
+        private unsafe void LoadModel()
+        {
+            using var assimp = Assimp.GetApi();
+            var scene = assimp.ImportFile(MODEL_PATH, (uint)PostProcessPreset.TargetRealTimeMaximumQuality);
+
+            var vertexMap = new Dictionary<Vertex, uint>();
+            var vertices = new List<Vertex>();
+            var indices = new List<uint>();
+
+            VisitSceneNode(scene->MRootNode);
+
+            assimp.ReleaseImport(scene);
+
+            this.vertices = vertices.ToArray();
+            this.indices = indices.ToArray();
+
+            void VisitSceneNode(Node* node)
+            {
+                for (int m = 0; m < node->MNumMeshes; m++)
+                {
+                    var mesh = scene->MMeshes[node->MMeshes[m]];
+
+                    for (int f = 0; f < mesh->MNumFaces; f++)
+                    {
+                        var face = mesh->MFaces[f];
+
+                        for (int i = 0; i < face.MNumIndices; i++)
+                        {
+                            uint index = face.MIndices[i];
+
+                            var position = mesh->MVertices[index];
+                            var texture = mesh->MTextureCoords[0][(int)index];
+
+                            Vertex vertex = new()
+                            {
+                                pos = new Vector3D<float>(position.X, position.Y, position.Z),
+                                color = new Vector3D<float>(1, 1, 1),
+                                //Flip Y for OBJ in Vulkan
+                                textCoord = new Vector2D<float>(texture.X, 1.0f - texture.Y)
+                            };
+
+                            if (vertexMap.TryGetValue(vertex, out var meshIndex))
+                            {
+                                indices.Add(meshIndex);
+                            }
+                            else
+                            {
+                                indices.Add((uint)vertices.Count);
+                                vertexMap[vertex] = (uint)vertices.Count;
+                                vertices.Add(vertex);
+                            }
+                        }
+                    }
+                }
+
+                for (int c = 0; c < node->MNumChildren; c++)
+                {
+                    VisitSceneNode(node->MChildren[c]);
                 }
             }
         }
@@ -1294,7 +1886,7 @@ namespace VulkanWindow
             vulkan!.BindBufferMemory(device, buffer, bufferMemory, 0);
         }
 
-        private void CopyBuffer(Buffer srcBuffer, Buffer dstBuffer, ulong size)
+        private CommandBuffer BeginSingleTimeCommands()
         {
             var allocateInfo = new CommandBufferAllocateInfo()
             {
@@ -1304,7 +1896,7 @@ namespace VulkanWindow
                 CommandBufferCount = 1,
             };
 
-            vulkan!.AllocateCommandBuffers(device, in allocateInfo, out CommandBuffer commandBuffer);
+            vulkan!.AllocateCommandBuffers(device, in allocateInfo, out var commandBuffer);
 
             var beginInfo = new CommandBufferBeginInfo()
             {
@@ -1313,14 +1905,11 @@ namespace VulkanWindow
             };
 
             vulkan!.BeginCommandBuffer(commandBuffer, in beginInfo);
+            return commandBuffer;
+        }
 
-            var copyRegion = new BufferCopy()
-            {
-                Size = size,
-            };
-
-            vulkan!.CmdCopyBuffer(commandBuffer, srcBuffer, dstBuffer, 1, in copyRegion);
-
+        private void EndSingleTimeCommands(CommandBuffer commandBuffer)
+        {
             vulkan!.EndCommandBuffer(commandBuffer);
 
             SubmitInfo submitInfo;
@@ -1338,6 +1927,20 @@ namespace VulkanWindow
             vulkan!.QueueWaitIdle(graphicsQueue);
 
             vulkan!.FreeCommandBuffers(device, commandPool, 1, in commandBuffer);
+        }
+
+        private void CopyBuffer(Buffer srcBuffer, Buffer dstBuffer, ulong size)
+        {
+            CommandBuffer commandBuffer = BeginSingleTimeCommands();
+
+            var copyRegion = new BufferCopy()
+            {
+                Size = size,
+            };
+
+            vulkan!.CmdCopyBuffer(commandBuffer, srcBuffer, dstBuffer, 1, in copyRegion);
+
+            EndSingleTimeCommands(commandBuffer);
         }
 
         private void CreateVertexBuffer()
@@ -1368,7 +1971,7 @@ namespace VulkanWindow
         #region Create index buffer
         private void CreateIndexBuffer()
         {
-            var bufferSize = (ulong)(Unsafe.SizeOf<ushort>() * indices.Length);
+            var bufferSize = (ulong)(Unsafe.SizeOf<uint>() * indices!.Length);
 
             Buffer stagingBuffer = default;
             DeviceMemory stagingBufferMemory = default;
@@ -1378,7 +1981,7 @@ namespace VulkanWindow
             {
                 void* data;
                 vulkan!.MapMemory(device, stagingBufferMemory, 0, bufferSize, 0, &data);
-                indices.AsSpan().CopyTo(new Span<ushort>(data, indices.Length));
+                indices.AsSpan().CopyTo(new Span<uint>(data, indices.Length));
                 vulkan!.UnmapMemory(device, stagingBufferMemory);
 
                 CreateBuffer(bufferSize, BufferUsageFlags.TransferDstBit | BufferUsageFlags.IndexBufferBit, MemoryPropertyFlags.DeviceLocalBit, ref indexBuffer, ref indexBufferMemory);
@@ -1394,24 +1997,33 @@ namespace VulkanWindow
         #region Create descriptor pool
         private void CreateDescriptorPool()
         {
-            var poolSize = new DescriptorPoolSize()
+            var poolSizes = new DescriptorPoolSize[]
             {
-                Type = DescriptorType.UniformBuffer,
-                DescriptorCount = (uint)swapChainImages!.Length,
+                new()
+                {
+                    Type = DescriptorType.UniformBuffer,
+                    DescriptorCount = (uint)swapChainImages!.Length,
+                },
+                new()
+                {
+                    Type = DescriptorType.CombinedImageSampler,
+                    DescriptorCount = (uint)swapChainImages!.Length,
+                }
             };
 
             unsafe
             {
-                var poolInfo = new DescriptorPoolCreateInfo()
-                {
-                    SType = StructureType.DescriptorPoolCreateInfo,
-                    PoolSizeCount = 1,
-                    PPoolSizes = &poolSize,
-                    MaxSets = (uint)swapChainImages!.Length,
-                };
-
+                fixed (DescriptorPoolSize* poolSizesPtr = poolSizes)
                 fixed (DescriptorPool* descriptorPoolPtr = &descriptorPool)
                 {
+                    var poolInfo = new DescriptorPoolCreateInfo()
+                    {
+                        SType = StructureType.DescriptorPoolCreateInfo,
+                        PoolSizeCount = (uint)poolSizes.Length,
+                        PPoolSizes = poolSizesPtr,
+                        MaxSets = (uint)swapChainImages!.Length,
+                    };
+
                     if (vulkan!.CreateDescriptorPool(device, in poolInfo, null, descriptorPoolPtr) != Result.Success)
                     {
                         throw new Exception("failed to create descriptor pool!");
@@ -1450,29 +2062,52 @@ namespace VulkanWindow
                 }
             }
 
-            for (int i = 0; i < swapChainImages.Length; i++)
+            for (var x = 0; x < swapChainImages.Length; x++)
             {
                 var bufferInfo = new DescriptorBufferInfo()
                 {
-                    Buffer = uniformBuffers![i],
+                    Buffer = uniformBuffers![x],
                     Offset = 0,
                     Range = (ulong)Unsafe.SizeOf<UniformBufferObject>(),
                 };
 
+                var imageInfo = new DescriptorImageInfo()
+                {
+                    ImageLayout = ImageLayout.ShaderReadOnlyOptimal,
+                    ImageView = textureImageView,
+                    Sampler = textureSampler,
+                };
+
                 unsafe
                 {
-                    var descriptorWrite = new WriteDescriptorSet()
+                    var descriptorWrites = new WriteDescriptorSet[]
+                    {
+                    new()
                     {
                         SType = StructureType.WriteDescriptorSet,
-                        DstSet = descriptorSets[i],
+                        DstSet = descriptorSets[x],
                         DstBinding = 0,
                         DstArrayElement = 0,
                         DescriptorType = DescriptorType.UniformBuffer,
                         DescriptorCount = 1,
                         PBufferInfo = &bufferInfo,
+                    },
+                    new()
+                    {
+                        SType = StructureType.WriteDescriptorSet,
+                        DstSet = descriptorSets[x],
+                        DstBinding = 1,
+                        DstArrayElement = 0,
+                        DescriptorType = DescriptorType.CombinedImageSampler,
+                        DescriptorCount = 1,
+                        PImageInfo = &imageInfo,
+                    }
                     };
 
-                    vulkan!.UpdateDescriptorSets(device, 1, in descriptorWrite, 0, null);
+                    fixed (WriteDescriptorSet* descriptorWritesPtr = descriptorWrites)
+                    {
+                        vulkan!.UpdateDescriptorSets(device, (uint)descriptorWrites.Length, descriptorWritesPtr, 0, null);
+                    }
                 }
             }
         }
@@ -1526,18 +2161,27 @@ namespace VulkanWindow
                     }
                 };
 
-                var clearColor = new ClearValue()
+                var clearValues = new ClearValue[]
                 {
-                    Color = new() { Float32_0 = 0, Float32_1 = 0, Float32_2 = 0, Float32_3 = 1 },
+                    new()
+                    {
+                        Color = new (){ Float32_0 = 0, Float32_1 = 0, Float32_2 = 0, Float32_3 = 1 },
+                    },
+                    new()
+                    {
+                        DepthStencil = new () { Depth = 1, Stencil = 0 }
+                    }
                 };
-
-                renderPassInfo.ClearValueCount = 1;
 
                 unsafe
                 {
-                    renderPassInfo.PClearValues = &clearColor;
+                    fixed (ClearValue* clearValuesPtr = clearValues)
+                    {
+                        renderPassInfo.ClearValueCount = (uint)clearValues.Length;
+                        renderPassInfo.PClearValues = clearValuesPtr;
 
-                    vulkan!.CmdBeginRenderPass(commandBuffers[x], &renderPassInfo, SubpassContents.Inline);
+                        vulkan!.CmdBeginRenderPass(commandBuffers[x], &renderPassInfo, SubpassContents.Inline);
+                    }
                 }
 
                 vulkan!.CmdBindPipeline(commandBuffers[x], PipelineBindPoint.Graphics, graphicsPipeline);
@@ -1554,7 +2198,7 @@ namespace VulkanWindow
                     }
                 }
 
-                vulkan!.CmdBindIndexBuffer(commandBuffers[x], indexBuffer, 0, IndexType.Uint16);
+                vulkan!.CmdBindIndexBuffer(commandBuffers[x], indexBuffer, 0, IndexType.Uint32);
 
                 unsafe
                 {
@@ -1570,7 +2214,7 @@ namespace VulkanWindow
                     );
                 }
 
-                vulkan!.CmdDrawIndexed(commandBuffers[x], (uint)indices.Length, 1, 0, 0, 0);
+                vulkan!.CmdDrawIndexed(commandBuffers[x], (uint)indices!.Length, 1, 0, 0, 0);
                 vulkan!.CmdEndRenderPass(commandBuffers[x]);
 
                 if (vulkan!.EndCommandBuffer(commandBuffers[x]) != Result.Success)
@@ -1637,10 +2281,22 @@ namespace VulkanWindow
             CreateDescriptorSetLayout();
             DebugLog($"PHASE: {nameof(CreateGraphicsPipeline)}");
             CreateGraphicsPipeline();
-            DebugLog($"PHASE: {nameof(CreateFramebuffers)}");
-            CreateFramebuffers();
             DebugLog($"PHASE: {nameof(CreateCommandPool)}");
             CreateCommandPool();
+            DebugLog($"PHASE: {nameof(CreateColorResources)}");
+            CreateColorResources();
+            DebugLog($"PHASE: {nameof(CreateDepthResources)}");
+            CreateDepthResources();
+            DebugLog($"PHASE: {nameof(CreateFramebuffers)}");
+            CreateFramebuffers();
+            DebugLog($"PHASE: {nameof(CreateTextureImage)}");
+            CreateTextureImage();
+            DebugLog($"PHASE: {nameof(CreateTextureImageView)}");
+            CreateTextureImageView();
+            DebugLog($"PHASE: {nameof(CreateTextureSampler)}");
+            CreateTextureSampler();
+            DebugLog($"PHASE: {nameof(LoadModel)}");
+            LoadModel();
             DebugLog($"PHASE: {nameof(CreateVertexBuffer)}");
             CreateVertexBuffer();
             DebugLog($"PHASE: {nameof(CreateIndexBuffer)}");

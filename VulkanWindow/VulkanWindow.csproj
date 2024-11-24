@@ -9,17 +9,36 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <PackageReference Include="Silk.NET.Assimp" Version="2.22.0" />
     <PackageReference Include="Silk.NET.Input" Version="2.22.0" />
     <PackageReference Include="Silk.NET.Vulkan" Version="2.22.0" />
     <PackageReference Include="Silk.NET.Vulkan.Extensions.EXT" Version="2.22.0" />
     <PackageReference Include="Silk.NET.Vulkan.Extensions.KHR" Version="2.22.0" />
     <PackageReference Include="Silk.NET.Windowing" Version="2.22.0" />
+    <PackageReference Include="SixLabors.ImageSharp" Version="3.1.6" />
     <PackageReference Include="System.Text.Json" Version="9.0.0" />
   </ItemGroup>
 
 	<ItemGroup>
 		<VertexShader Include="Shaders/**/*.vert" />
 		<FragmentShader Include="Shaders/**/*.frag" />
+	</ItemGroup>
+
+	<ItemGroup>
+	  <Folder Include="Assets\Objects\" />
+	  <Folder Include="Assets\Textures\" />
+	</ItemGroup>
+
+	<ItemGroup>
+	  <None Update="Assets\Objects\viking_room.obj">
+	    <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+	  </None>
+	  <None Update="Assets\Textures\texture.jpg">
+	    <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+	  </None>
+	  <None Update="Assets\Textures\viking_room.png">
+	    <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+	  </None>
 	</ItemGroup>
 
 </Project>
