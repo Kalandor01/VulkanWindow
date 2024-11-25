@@ -397,35 +397,6 @@ namespace VulkanWindow
 
             return details;
         }
-
-        private void UpdateUniformBuffer(uint currentImage)
-        {
-            //Silk Window has timing information so we are skipping the time code.
-            var time = window!.Time;
-
-            UniformBufferObject ubo = new()
-            {
-                model = Matrix4X4<float>.Identity * Matrix4X4.CreateFromAxisAngle(new Vector3D<float>(0, 0, 1), (float)time * Scalar.DegreesToRadians(90.0f)),
-                view = Matrix4X4.CreateLookAt(new Vector3D<float>(2, 2, 2), new Vector3D<float>(0, 0, 0), new Vector3D<float>(0, 0, 1)),
-                proj = Matrix4X4.CreatePerspectiveFieldOfView(Scalar.DegreesToRadians(45.0f), (float)swapChainExtent.Width / swapChainExtent.Height, 0.1f, 10.0f),
-            };
-            ubo.proj.M22 *= -1;
-
-            unsafe
-            {
-                void* data;
-                vulkan!.MapMemory(
-                    device,
-                    uniformBuffersMemory![currentImage],
-                    0,
-                    (ulong)Unsafe.SizeOf<UniformBufferObject>(),
-                    0,
-                    &data
-                );
-                new Span<UniformBufferObject>(data, 1)[0] = ubo;
-                vulkan!.UnmapMemory(device, uniformBuffersMemory![currentImage]);
-            }
-        }
         #endregion
 
         #region Create instance
@@ -1016,7 +987,7 @@ namespace VulkanWindow
                 Layout = ImageLayout.DepthStencilAttachmentOptimal,
             };
 
-            AttachmentReference colorAttachmentResolveRef = new()
+            var colorAttachmentResolveRef = new AttachmentReference()
             {
                 Attachment = 2,
                 Layout = ImageLayout.ColorAttachmentOptimal,
@@ -1537,8 +1508,8 @@ namespace VulkanWindow
             var imageSize = (ulong)(img.Width * img.Height * img.PixelType.BitsPerPixel / 8);
             mipLevels = (uint)(Math.Floor(Math.Log2(Math.Max(img.Width, img.Height))) + 1);
 
-            Buffer stagingBuffer = default;
-            DeviceMemory stagingBufferMemory = default;
+            var stagingBuffer = default(Buffer);
+            var stagingBufferMemory = default(DeviceMemory);
             CreateBuffer(imageSize, BufferUsageFlags.TransferSrcBit, MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit, ref stagingBuffer, ref stagingBufferMemory);
 
             unsafe
@@ -1549,7 +1520,18 @@ namespace VulkanWindow
                 vulkan!.UnmapMemory(device, stagingBufferMemory);
             }
 
-            CreateImage((uint)img.Width, (uint)img.Height, mipLevels, SampleCountFlags.Count1Bit, Format.R8G8B8A8Srgb, ImageTiling.Optimal, ImageUsageFlags.TransferSrcBit | ImageUsageFlags.TransferDstBit | ImageUsageFlags.SampledBit, MemoryPropertyFlags.DeviceLocalBit, ref textureImage, ref textureImageMemory);
+            CreateImage(
+                (uint)img.Width,
+                (uint)img.Height,
+                mipLevels,
+                SampleCountFlags.Count1Bit,
+                Format.R8G8B8A8Srgb,
+                ImageTiling.Optimal,
+                ImageUsageFlags.TransferSrcBit | ImageUsageFlags.TransferDstBit | ImageUsageFlags.SampledBit,
+                MemoryPropertyFlags.DeviceLocalBit,
+                ref textureImage,
+                ref textureImageMemory
+            );
 
             TransitionImageLayout(textureImage, Format.R8G8B8A8Srgb, ImageLayout.Undefined, ImageLayout.TransferDstOptimal, mipLevels);
             CopyBufferToImage(stagingBuffer, textureImage, (uint)img.Width, (uint)img.Height);
@@ -1771,27 +1753,27 @@ namespace VulkanWindow
 
             assimp.ReleaseImport(scene);
 
-            this.vertices = vertices.ToArray();
-            this.indices = indices.ToArray();
+            this.vertices = [.. vertices];
+            this.indices = [.. indices];
 
             void VisitSceneNode(Node* node)
             {
-                for (int m = 0; m < node->MNumMeshes; m++)
+                for (var m = 0; m < node->MNumMeshes; m++)
                 {
                     var mesh = scene->MMeshes[node->MMeshes[m]];
 
-                    for (int f = 0; f < mesh->MNumFaces; f++)
+                    for (var f = 0; f < mesh->MNumFaces; f++)
                     {
                         var face = mesh->MFaces[f];
 
-                        for (int i = 0; i < face.MNumIndices; i++)
+                        for (var x = 0; x < face.MNumIndices; x++)
                         {
-                            uint index = face.MIndices[i];
+                            uint index = face.MIndices[x];
 
                             var position = mesh->MVertices[index];
                             var texture = mesh->MTextureCoords[0][(int)index];
 
-                            Vertex vertex = new()
+                            var vertex = new Vertex()
                             {
                                 pos = new Vector3D<float>(position.X, position.Y, position.Z),
                                 color = new Vector3D<float>(1, 1, 1),
@@ -1945,7 +1927,7 @@ namespace VulkanWindow
 
         private void CreateVertexBuffer()
         {
-            var bufferSize = (ulong)(Unsafe.SizeOf<Vertex>() * vertices.Length);
+            var bufferSize = (ulong)(Unsafe.SizeOf<Vertex>() * vertices!.Length);
 
             Buffer stagingBuffer = default;
             DeviceMemory stagingBufferMemory = default;
@@ -2315,17 +2297,62 @@ namespace VulkanWindow
         #endregion
 
         #region Events
+        private double prewTime = 0;
+        private Vector3D<float> moveVector = new(0, 0, 1);
+        private float moveSpeed = 90;
+        private Matrix4X4<float> prewMatrix = Matrix4X4.CreateFromAxisAngle(new Vector3D<float>(0, 0, 1), 1f);
+
+        private float camreaDistanceKindOf = 2;
+        private double cameraSpeed = 0;
+
         public void OnLoad()
         {
             //Set-up input context.
             var input = window!.CreateInput();
-            for (int i = 0; i < input.Keyboards.Count; i++)
+            for (int x = 0; x < input.Keyboards.Count; x++)
             {
-                input.Keyboards[i].KeyDown += KeyDown;
+                input.Keyboards[x].KeyChar += CharPressed;
+                input.Keyboards[x].KeyDown += KeyDown;
             }
         }
 
-        public void OnRender(double delta)
+        private void UpdateUniformBuffer(uint currentImage, double deltaTime)
+        {
+            //Silk Window has timing information so we are skipping the time code.
+            var time = window!.Time;
+
+            var newMatrix = prewMatrix * Matrix4X4.CreateFromAxisAngle(moveVector, (float)(deltaTime * Scalar.DegreesToRadians(moveSpeed)));
+            prewMatrix = newMatrix;
+            
+            camreaDistanceKindOf = (float)(camreaDistanceKindOf + cameraSpeed);
+
+            var ubo = new UniformBufferObject()
+            {
+                model = Matrix4X4<float>.Identity * newMatrix,
+                view = Matrix4X4.CreateLookAt(new Vector3D<float>(camreaDistanceKindOf, camreaDistanceKindOf, camreaDistanceKindOf), new Vector3D<float>(0, 0, 0), new Vector3D<float>(0, 0, 1)),
+                proj = Matrix4X4.CreatePerspectiveFieldOfView(Scalar.DegreesToRadians(45.0f), (float)swapChainExtent.Width / swapChainExtent.Height, 0.1f, 10.0f),
+            };
+            ubo.proj.M22 *= -1;
+
+            unsafe
+            {
+                void* data;
+                vulkan!.MapMemory(
+                    device,
+                    uniformBuffersMemory![currentImage],
+                    0,
+                    (ulong)Unsafe.SizeOf<UniformBufferObject>(),
+                    0,
+                    &data
+                );
+                new Span<UniformBufferObject>(data, 1)[0] = ubo;
+                vulkan!.UnmapMemory(device, uniformBuffersMemory![currentImage]);
+            }
+
+            prewTime = time;
+        }
+
+        public void OnRender(double deltaTime)
         {
             vulkan!.WaitForFences(device, 1, in inFlightFences![currentFrame], true, ulong.MaxValue);
 
@@ -2342,7 +2369,7 @@ namespace VulkanWindow
                 throw new Exception("failed to acquire swap chain image!");
             }
 
-            UpdateUniformBuffer(imageIndex);
+            UpdateUniformBuffer(imageIndex, deltaTime);
 
             if (imagesInFlight![imageIndex].Handle != default)
             {
@@ -2429,7 +2456,7 @@ namespace VulkanWindow
             frameBufferResized = newSize.Y > 0 && newSize.X > 0;
         }
 
-        public void OnUpdate(double obj)
+        public void OnUpdate(double deltaTime)
         {
             //Here all updates to the program should be done.
         }
@@ -2439,12 +2466,60 @@ namespace VulkanWindow
             //Update aspect ratios, clipping regions, viewports, etc.
         }
 
-        public void KeyDown(IKeyboard arg1, Key arg2, int arg3)
+        /// <summary>
+        /// Called every frame the key is pressed.
+        /// </summary>
+        /// <param name="keyboard"></param>
+        /// <param name="pressedKey"></param>
+        public void CharPressed(IKeyboard keyboard, char pressedKey)
         {
-            //Check to close the window on escape.
-            if (arg2 == Key.Escape)
+            //moveSpeed += 10;
+        }
+
+        /// <summary>
+        /// Called only once per press.
+        /// </summary>
+        /// <param name="keyboard"></param>
+        /// <param name="pressedKey"></param>
+        /// <param name="arg3"></param>
+        public void KeyDown(IKeyboard keyboard, Key pressedKey, int arg3)
+        {
+            switch (pressedKey)
             {
-                window!.Close();
+                case Key.Escape:
+                    window!.Close();
+                    break;
+                case Key.Q:
+                    cameraSpeed -= 0.1;
+                    break;
+                case Key.E:
+                    cameraSpeed += 0.1;
+                    break;
+                case Key.W:
+                    moveVector = new Vector3D<float>(0, 1, 0);
+                    break;
+                case Key.S:
+                    moveVector = new Vector3D<float>(0, -1, 0);
+                    break;
+                case Key.A:
+                    moveVector = new Vector3D<float>(0, 0, -1);
+                    break;
+                case Key.D:
+                    moveVector = new Vector3D<float>(0, 0, 1);
+                    break;
+                case Key.Up:
+                    moveSpeed += 10;
+                    break;
+                case Key.Down:
+                    moveSpeed -= 10;
+                    break;
+                case Key.R:
+                    cameraSpeed = 0;
+                    camreaDistanceKindOf = 2;
+                    moveSpeed = 90;
+                    moveVector = new Vector3D<float>(0, 0, 1);
+                    prewMatrix = Matrix4X4.CreateFromAxisAngle(moveVector, (float)(0.1 * Scalar.DegreesToRadians(moveSpeed)));
+                    break;
             }
         }
         #endregion
