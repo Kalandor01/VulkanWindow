@@ -1,12 +1,13 @@
 ﻿using Silk.NET.Assimp;
 using Silk.NET.Core;
 using Silk.NET.Core.Native;
-using Silk.NET.Input;
+using Silk.NET.GLFW;
 using Silk.NET.Maths;
 using Silk.NET.Vulkan;
 using Silk.NET.Vulkan.Extensions.EXT;
 using Silk.NET.Vulkan.Extensions.KHR;
 using Silk.NET.Windowing;
+using Silk.NET.Windowing.Glfw;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using Buffer = Silk.NET.Vulkan.Buffer;
@@ -101,7 +102,7 @@ namespace VulkanWindow
         #endregion
 
         #region Fields
-        private IWindow? window;
+        private readonly IWindow window;
         private Vk? vulkan;
         private Instance vulkanInstance;
         private ExtDebugUtils? debugUtils;
@@ -214,7 +215,7 @@ namespace VulkanWindow
         #region Public methods
         public void Display()
         {
-            window!.Run();
+            window.Run();
             vulkan!.DeviceWaitIdle(device);
         }
 
@@ -417,7 +418,7 @@ namespace VulkanWindow
 
         private unsafe string[] GetRequiredExtensions()
         {
-            var glfwExtensions = window!.VkSurface!.GetRequiredExtensions(out var glfwExtensionCount);
+            var glfwExtensions = window.VkSurface!.GetRequiredExtensions(out var glfwExtensionCount);
             var extensions = SilkMarshal.PtrToStringArray((nint)glfwExtensions, (int)glfwExtensionCount);
 
             if (EnableValidationLayers)
@@ -708,7 +709,7 @@ namespace VulkanWindow
 
             unsafe
             {
-                surface = window!.VkSurface!.Create<AllocationCallbacks>(vulkanInstance.ToHandle(), null).ToSurface();
+                surface = window.VkSurface!.Create<AllocationCallbacks>(vulkanInstance.ToHandle(), null).ToSurface();
             }
         }
         #endregion
@@ -748,7 +749,7 @@ namespace VulkanWindow
             }
             else
             {
-                var framebufferSize = window!.FramebufferSize;
+                var framebufferSize = window.FramebufferSize;
 
                 Extent2D actualExtent = new()
                 {
@@ -861,7 +862,7 @@ namespace VulkanWindow
 
         private void RecreateSwapChain()
         {
-            Vector2D<int> framebufferSize = window!.FramebufferSize;
+            Vector2D<int> framebufferSize = window.FramebufferSize;
 
             while (framebufferSize.X == 0 || framebufferSize.Y == 0)
             {
@@ -1411,9 +1412,9 @@ namespace VulkanWindow
             var mipWidth = width;
             var mipHeight = height;
 
-            for (uint i = 1; i < mipLevels; i++)
+            for (uint x = 1; x < mipLevels; x++)
             {
-                barrier.SubresourceRange.BaseMipLevel = i - 1;
+                barrier.SubresourceRange.BaseMipLevel = x - 1;
                 barrier.OldLayout = ImageLayout.TransferDstOptimal;
                 barrier.NewLayout = ImageLayout.TransferSrcOptimal;
                 barrier.SrcAccessMask = AccessFlags.TransferWriteBit;
@@ -1439,29 +1440,31 @@ namespace VulkanWindow
                     SrcSubresource =
                     {
                         AspectMask = ImageAspectFlags.ColorBit,
-                        MipLevel = i - 1,
+                        MipLevel = x - 1,
                         BaseArrayLayer = 0,
                         LayerCount = 1,
                     },
                     DstOffsets =
                     {
                         Element0 = new Offset3D(0,0,0),
-                        Element1 = new Offset3D((int)(mipWidth > 1 ? mipWidth / 2 : 1), (int)(mipHeight > 1 ? mipHeight / 2 : 1),1),
+                        Element1 = new Offset3D((int)(mipWidth > 1 ? mipWidth / 2 : 1), (int)(mipHeight > 1 ? mipHeight / 2 : 1), 1),
                     },
                     DstSubresource =
                     {
                         AspectMask = ImageAspectFlags.ColorBit,
-                        MipLevel = i,
+                        MipLevel = x,
                         BaseArrayLayer = 0,
                         LayerCount = 1,
                     },
                 };
 
-                vulkan!.CmdBlitImage(commandBuffer,
+                vulkan!.CmdBlitImage(
+                    commandBuffer,
                     image, ImageLayout.TransferSrcOptimal,
                     image, ImageLayout.TransferDstOptimal,
                     1, in blit,
-                    Filter.Linear);
+                    Filter.Linear
+                );
 
                 barrier.OldLayout = ImageLayout.TransferSrcOptimal;
                 barrier.NewLayout = ImageLayout.ShaderReadOnlyOptimal;
@@ -1471,7 +1474,8 @@ namespace VulkanWindow
                 unsafe
                 {
                     vulkan!.CmdPipelineBarrier(
-                        commandBuffer, PipelineStageFlags.TransferBit, PipelineStageFlags.FragmentShaderBit, 0,
+                        commandBuffer, PipelineStageFlags.TransferBit,
+                        PipelineStageFlags.FragmentShaderBit, 0,
                         0, null,
                         0, null,
                         1, in barrier
@@ -1491,7 +1495,8 @@ namespace VulkanWindow
             unsafe
             {
                 vulkan!.CmdPipelineBarrier(
-                    commandBuffer, PipelineStageFlags.TransferBit, PipelineStageFlags.FragmentShaderBit, 0,
+                    commandBuffer, PipelineStageFlags.TransferBit,
+                    PipelineStageFlags.FragmentShaderBit, 0,
                     0, null,
                     0, null,
                     1, in barrier
@@ -2299,37 +2304,54 @@ namespace VulkanWindow
         #region Events
         private double prewTime = 0;
         private Vector3D<float> moveVector = new(0, 0, 1);
-        private float moveSpeed = 90;
+        private float moveSpeed = 0;
         private Matrix4X4<float> prewMatrix = Matrix4X4.CreateFromAxisAngle(new Vector3D<float>(0, 0, 1), 1f);
 
-        private float camreaDistanceKindOf = 2;
-        private double cameraSpeed = 0;
+        private double posX = 0;
+        private double posY = 0;
+        private double posZ = 0;
+
+        private double yaw = 0;
+        private double pitch = 0;
+        private double roll = 0;
+
+        private Vector2D<double>? prewPos = null;
+        private double mouseSentivity = 100;
+        private bool paused = false;
+
+        GlfwCallbacks.KeyCallback _keyCallback;
+        GlfwCallbacks.CursorPosCallback _cursorPosCallback;
 
         public void OnLoad()
         {
-            //Set-up input context.
-            var input = window!.CreateInput();
-            for (int x = 0; x < input.Keyboards.Count; x++)
+            var glfw = Glfw.GetApi();
+            unsafe
             {
-                input.Keyboards[x].KeyChar += CharPressed;
-                input.Keyboards[x].KeyDown += KeyDown;
+                _keyCallback = KeyCallback;
+                _cursorPosCallback = CursorPosCallback;
+                var wHandle = GlfwWindowing.GetHandle(window);
+                glfw.SetKeyCallback(wHandle, _keyCallback);
+                glfw.SetCursorPosCallback(wHandle, _cursorPosCallback);
             }
         }
 
         private void UpdateUniformBuffer(uint currentImage, double deltaTime)
         {
             //Silk Window has timing information so we are skipping the time code.
-            var time = window!.Time;
+            var time = window.Time;
 
             var newMatrix = prewMatrix * Matrix4X4.CreateFromAxisAngle(moveVector, (float)(deltaTime * Scalar.DegreesToRadians(moveSpeed)));
             prewMatrix = newMatrix;
             
-            camreaDistanceKindOf = (float)(camreaDistanceKindOf + cameraSpeed);
-
             var ubo = new UniformBufferObject()
             {
                 model = Matrix4X4<float>.Identity * newMatrix,
-                view = Matrix4X4.CreateLookAt(new Vector3D<float>(camreaDistanceKindOf, camreaDistanceKindOf, camreaDistanceKindOf), new Vector3D<float>(0, 0, 0), new Vector3D<float>(0, 0, 1)),
+                view = Matrix4X4.CreateTranslation((float)posX, (float)posY, (float)posZ)
+                    * Matrix4X4.CreateFromYawPitchRoll(
+                        (float)Scalar.DegreesToRadians(yaw),
+                        (float)Scalar.DegreesToRadians(pitch),
+                        (float)Scalar.DegreesToRadians(roll)
+                    ),
                 proj = Matrix4X4.CreatePerspectiveFieldOfView(Scalar.DegreesToRadians(45.0f), (float)swapChainExtent.Width / swapChainExtent.Height, 0.1f, 10.0f),
             };
             ubo.proj.M22 *= -1;
@@ -2437,7 +2459,7 @@ namespace VulkanWindow
                 frameBufferResized
             )
             {
-                if (frameBufferResized || window!.WindowState != WindowState.Normal)
+                if (frameBufferResized || window.WindowState != WindowState.Normal)
                 {
                     frameBufferResized = false;
                     RecreateSwapChain();
@@ -2466,59 +2488,98 @@ namespace VulkanWindow
             //Update aspect ratios, clipping regions, viewports, etc.
         }
 
-        /// <summary>
-        /// Called every frame the key is pressed.
-        /// </summary>
-        /// <param name="keyboard"></param>
-        /// <param name="pressedKey"></param>
-        public void CharPressed(IKeyboard keyboard, char pressedKey)
+        public unsafe void CursorPosCallback(WindowHandle* windowHandle, double x, double y)
         {
-            //moveSpeed += 10;
+            if (paused)
+            {
+                return;
+            }
+            if (prewPos is null)
+            {
+                prewPos = new Vector2D<double>(x, y);
+                return;
+            }
+
+            var size = window.Size;
+            var middle = size / 2;
+            var plusRoll = (x - middle.X) / size.X * mouseSentivity;
+            var plusPitch = (y - middle.Y) / size.Y * mouseSentivity;
+            Console.WriteLine($"mousemove: {x}, {y} -> {roll}, {pitch} -> {plusRoll}, {plusPitch}");
+            roll += plusRoll;
+            pitch += plusPitch;
+
+            var glfw = Glfw.GetApi();
+            glfw.SetCursorPos(windowHandle, middle.X, middle.Y);
         }
 
-        /// <summary>
-        /// Called only once per press.
-        /// </summary>
-        /// <param name="keyboard"></param>
-        /// <param name="pressedKey"></param>
-        /// <param name="arg3"></param>
-        public void KeyDown(IKeyboard keyboard, Key pressedKey, int arg3)
+        public unsafe void KeyCallback(WindowHandle* windowHandle, Keys key, int scanCode, InputAction inputAction, KeyModifiers keyModifiers)
         {
-            switch (pressedKey)
+            Console.WriteLine($"kypress: {key}, {scanCode}, {inputAction}, {keyModifiers}");
+            if (inputAction == InputAction.Release)
             {
-                case Key.Escape:
-                    window!.Close();
+                return;
+            }
+
+            switch (key)
+            {
+                case Keys.Escape:
+                    window.Close();
                     break;
-                case Key.Q:
-                    cameraSpeed -= 0.1;
+                case Keys.P:
+                    if (inputAction == InputAction.Press)
+                    {
+                        paused = !paused;
+                    }
                     break;
-                case Key.E:
-                    cameraSpeed += 0.1;
+
+                case Keys.Q:
+                    yaw += 1;
                     break;
-                case Key.W:
+                case Keys.E:
+                    yaw -= 1;
+                    break;
+
+                case Keys.W:
+                    posY -= 0.1;
+                    break;
+                case Keys.S:
+                    posY += 0.1;
+                    break;
+                case Keys.A:
+                    posX += 0.1;
+                    break;
+                case Keys.D:
+                    posX -= 0.1;
+                    break;
+                case Keys.Space:
+                    posZ -= 0.1;
+                    break;
+                case Keys.ShiftLeft:
+                    posZ += 0.1;
+                    break;
+
+                case Keys.Up:
                     moveVector = new Vector3D<float>(0, 1, 0);
                     break;
-                case Key.S:
+                case Keys.Down:
                     moveVector = new Vector3D<float>(0, -1, 0);
                     break;
-                case Key.A:
+                case Keys.Left:
                     moveVector = new Vector3D<float>(0, 0, -1);
                     break;
-                case Key.D:
+                case Keys.Right:
                     moveVector = new Vector3D<float>(0, 0, 1);
                     break;
-                case Key.Up:
-                    moveSpeed += 10;
-                    break;
-                case Key.Down:
-                    moveSpeed -= 10;
-                    break;
-                case Key.R:
-                    cameraSpeed = 0;
-                    camreaDistanceKindOf = 2;
-                    moveSpeed = 90;
-                    moveVector = new Vector3D<float>(0, 0, 1);
-                    prewMatrix = Matrix4X4.CreateFromAxisAngle(moveVector, (float)(0.1 * Scalar.DegreesToRadians(moveSpeed)));
+
+                case Keys.R:
+                    if ((keyModifiers & KeyModifiers.Control) != 0)
+                    {
+                        moveSpeed = 90;
+                        moveVector = new Vector3D<float>(0, 0, 1);
+                        prewMatrix = Matrix4X4.CreateFromAxisAngle(moveVector, (float)(0.1 * Scalar.DegreesToRadians(moveSpeed)));
+                        break;
+                    }
+                    yaw = 0;
                     break;
             }
         }
